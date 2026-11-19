@@ -3,8 +3,9 @@
 macOS 命令行 + 菜单栏的代理管理工具。用 **sing-box TUN** 做统一分流（国内直连 / 国外走代理），
 配合 **Cloudflare WARP** 作为运输层，支持全局/规则/纯直连切换，附原生菜单栏 GUI（ProxyBar）。
 
-> 面向「本机已有 WARP + 一个境外代理节点（SOCKS/HTTP）」的场景。节点地址在脚本内
-> `PROXY_HOST / PROXY_PORT / SOCKS_PORT` 配置，默认 `172.100.0.2:8443 / :1080`，按需修改。
+> 面向「本机已有 WARP + 一个境外代理节点（SOCKS/HTTP）」的场景。节点地址在
+> `~/.config/proxy-launch/config`（`PROXY_HOST / PROXY_PORT / SOCKS_PORT`）配置，
+> 默认 `172.100.0.2:8443 / :1080`，安装脚本会自动生成配置模板，按需修改即可。
 
 ## 架构
 
@@ -29,15 +30,47 @@ WARP: 提供 172.100.0.0/24 运输到 sharenet；自身出口为国内
 
 ## 安装
 
+### 方式一：下载 Release 预编译包（推荐，开箱即用）
+
+前往 [GitHub Releases](https://github.com/ZYC99/proxy-launch/releases) 下载对应包：
+
+- **`proxy-launch-v*-darwin-arm64-full.tar.gz`（完整包）**：内置 `sing-box` 二进制与预编译 `ProxyBar`，**无需安装 Homebrew 和 Xcode Command Line Tools**。
+- **`proxy-launch-v*-darwin-arm64-lite.tar.gz`（轻量包）**：内置预编译 `ProxyBar`，复用系统已通过 `brew install sing-box` 安装的 `sing-box`。
+
+解压并一键安装：
+
 ```bash
-./install.sh          # 拷贝到 ~/bin、编译 ProxyBar、装登录项
+tar -xzf proxy-launch-v*-darwin-arm64-full.tar.gz
+cd proxy-launch-v*-darwin-arm64-full
+./install.sh
 ```
 
-或手动：
+> 安装脚本会自动清理 macOS 的 `com.apple.quarantine` 隔离属性，拷贝文件到 `~/bin`、注册 `ProxyBar` 登录项并生成默认配置文件 `~/.config/proxy-launch/config`。
+> 如果系统已通过 Homebrew 安装 `sing-box`，脚本会自动优先复用系统版本。
+
+### 方式二：源码安装
+
+需要预先安装 `Xcode Command Line Tools`（提供 `swiftc`）与 `sing-box`（`brew install sing-box`）：
 
 ```bash
-mkdir -p ~/bin && cp proxy-launch ~/bin/ && chmod +x ~/bin/proxy-launch
-swiftc -O -framework AppKit -o ~/bin/ProxyBar ProxyBar.swift
+./install.sh          # 拷贝到 ~/bin、编译 ProxyBar、装登录项、生成配置模板
+```
+
+### 配置上游节点
+
+编辑 `~/.config/proxy-launch/config` 修改为你的境外代理节点地址与端口：
+
+```bash
+PROXY_HOST=172.100.0.2
+PROXY_PORT=8443
+SOCKS_PORT=1080
+SYSTEM_KIND=http
+```
+
+改完后启动（或重载）：
+
+```bash
+proxy-launch on       # 启用 sing-box TUN 分流（会请求管理员权限）
 ```
 
 ## 使用

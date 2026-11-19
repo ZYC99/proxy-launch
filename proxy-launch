@@ -23,6 +23,10 @@ if [ "$(id -u)" -eq 0 ]; then
   HOME="$(eval echo "~${_own}")"
 fi
 
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/proxy-launch"
+CONFIG_FILE="$CONFIG_DIR/config"
+[ -r "$CONFIG_FILE" ] && . "$CONFIG_FILE"
+
 PROXY_HOST="${PROXY_HOST:-172.100.0.2}"
 PROXY_PORT="${PROXY_PORT:-8443}"
 SOCKS_PORT="${SOCKS_PORT:-1080}"
@@ -35,16 +39,12 @@ DRY_RUN=0
 LIST_ONLY=0
 
 # 系统代理的类型：http（默认，写 HTTP/HTTPS 端口）或 socks（写 SOCKS5 端口）
-CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/proxy-launch"
 MIHOMO_BIN="${MIHOMO_BIN:-/Applications/Clash Verge.app/Contents/MacOS/verge-mihomo}"
 MIHOMO_GEO_SRC="${MIHOMO_GEO_SRC:-$HOME/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev}"
 MIHOMO_DIR="$CONFIG_DIR/mihomo"
 MIHOMO_CFG="$MIHOMO_DIR/config.yaml"
 MIHOMO_PORT="${MIHOMO_PORT:-7890}"
 MIHOMO_API="${MIHOMO_API:-127.0.0.1:9090}"
-CONFIG_FILE="$CONFIG_DIR/config"
-SYSTEM_KIND="${SYSTEM_KIND:-http}"
-[ -r "$CONFIG_FILE" ] && . "$CONFIG_FILE"
 SYSTEM_KIND="${SYSTEM_KIND:-http}"
 
 c_info()  { printf '\033[36m%s\033[0m\n' "$*"; }
@@ -368,14 +368,22 @@ clash_tun_off() {
 # ---- sing-box TUN（macOS 更稳的 TUN 实现，推荐）--------------------------------
 # 评估结论(2026-11-17)：sing-box 1.14 在 WARP 嵌套下重启稳定（mihomo TUN 重启会 DNS 环路），
 # 靠 outbound bind_interface 显式绑定（sharenet→utun4、direct→en0）解决上游/环路问题。
-SB_BIN="${SB_BIN:-/opt/homebrew/bin/sing-box}"
+find_singbox() {
+  if [ -n "${SB_BIN:-}" ] && [ -x "$SB_BIN" ]; then printf '%s' "$SB_BIN"; return 0; fi
+  local p
+  for p in /opt/homebrew/bin/sing-box /usr/local/bin/sing-box "$HOME/bin/sing-box" "$(dirname "$SELF")/sing-box"; do
+    if [ -x "$p" ]; then printf '%s' "$p"; return 0; fi
+  done
+  command -v sing-box 2>/dev/null || printf '%s' "/opt/homebrew/bin/sing-box"
+}
+SB_BIN="$(find_singbox)"
 SB_DIR="$CONFIG_DIR/singbox"
 SB_CFG="$SB_DIR/config.json"
 SB_LABEL="com.zyc.sharenet-sb"
 SB_PLIST="/Library/LaunchDaemons/${SB_LABEL}.plist"
 
 sb_build() {
-  [ -x "$SB_BIN" ] || { c_err "未安装 sing-box：brew install sing-box"; return 1; }
+  [ -x "$SB_BIN" ] || { c_err "未找到 sing-box：请安装 Release 完整包或执行 brew install sing-box"; return 1; }
   mkdir -p "$SB_DIR" || return 1
   # 确保 direct-extra.yaml / proxy-extra.yaml 已同步最新规则
   DRY_RUN=0 clash_rules_write 2>/dev/null || true
