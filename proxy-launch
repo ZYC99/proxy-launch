@@ -1,0 +1,1495 @@
+#!/bin/bash
+# proxy-launch —— 通过 sharenet 隧道代理启动指定应用
+#
+# 用法: proxy-launch [-h] [-l] [-d] [-s] [-S|-H] <应用名> [传给应用的参数...]
+# 应用清单见 proxy-launch -h
+#
+# 设计要点:
+#   1. ChatGPT、Claude 桌面端和 CLI 默认 HTTP 8443。
+#      可用环境变量 PROXY_HOST / PROXY_PORT / SOCKS_PORT 覆盖地址和端口。
+#   2. GUI 应用（Claude 桌面端、Chrome）用 Chromium 的 --proxy-server 参数启动，
+#      不改动系统网络设置；加 -s 才写系统代理（需要 sudo）。
+#   3. 命令行工具（claude-cli / codex / git / npm / pip / brew）通过环境变量注入代理。
+#   4. ChatGPT / Gemini 或 -s 会修改系统代理；--off 关闭代理，不恢复历史配置。
+
+set -uo pipefail
+HOME="${HOME:-/var/root}"; export HOME   # LaunchDaemon 以 root 运行时没有 HOME
+
+SELF="$(cd "$(dirname "$0")" 2>/dev/null && pwd)/$(basename "$0")"
+# 以 root（osascript 管理员）运行时 HOME=/var/root，会写错配置目录；
+# 定位到脚本属主的真实 home，保证 CONFIG_DIR 始终指向用户配置。
+if [ "$(id -u)" -eq 0 ]; then
+  _own="$(stat -f '%Su' /dev/console 2>/dev/null || stat -f '%Su' "$SELF" 2>/dev/null || echo "${SUDO_USER:-root}")"
+  HOME="$(eval echo "~${_own}")"
+fi
+
+PROXY_HOST="${PROXY_HOST:-172.100.0.2}"
+PROXY_PORT="${PROXY_PORT:-8443}"
+SOCKS_PORT="${SOCKS_PORT:-1080}"
+CHROME_PROFILE="${CHROME_PROXY_PROFILE:-$HOME/.chrome-proxy-profile}"
+
+MODE="app"          # app | system | off
+USE_SOCKS=0
+PROTOCOL_OVERRIDE=""
+DRY_RUN=0
+LIST_ONLY=0
+
+# 系统代理的类型：http（默认，写 HTTP/HTTPS 端口）或 socks（写 SOCKS5 端口）
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/proxy-launch"
+MIHOMO_BIN="${MIHOMO_BIN:-/Applications/Clash Verge.app/Contents/MacOS/verge-mihomo}"
+MIHOMO_GEO_SRC="${MIHOMO_GEO_SRC:-$HOME/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev}"
+MIHOMO_DIR="$CONFIG_DIR/mihomo"
+MIHOMO_CFG="$MIHOMO_DIR/config.yaml"
+MIHOMO_PORT="${MIHOMO_PORT:-7890}"
+MIHOMO_API="${MIHOMO_API:-127.0.0.1:9090}"
+CONFIG_FILE="$CONFIG_DIR/config"
+SYSTEM_KIND="${SYSTEM_KIND:-http}"
+[ -r "$CONFIG_FILE" ] && . "$CONFIG_FILE"
+SYSTEM_KIND="${SYSTEM_KIND:-http}"
+
+c_info()  { printf '\033[36m%s\033[0m\n' "$*"; }
+c_ok()    { printf '\033[32m%s\033[0m\n' "$*"; }
+c_warn()  { printf '\033[33m%s\033[0m\n' "$*" >&2; }
+c_err()   { printf '\033[31m%s\033[0m\n' "$*" >&2; }
+
+proxy_url() {
+  if [ "$USE_SOCKS" -eq 1 ]; then
+    printf 'socks5h://%s:%s' "$PROXY_HOST" "$SOCKS_PORT"
+  else
+    printf 'http://%s:%s' "$PROXY_HOST" "$PROXY_PORT"
+  fi
+}
+
+# Chromium 系列只认 socks5:// 语法，不能带 h
+chromium_proxy() {
+  if [ "$USE_SOCKS" -eq 1 ]; then
+    printf 'socks5://%s:%s' "$PROXY_HOST" "$SOCKS_PORT"
+  else
+    proxy_url
+  fi
+}
+
+select_protocol() {
+  local kind="${PROTOCOL_OVERRIDE}"
+  if [ -z "$kind" ]; then
+    case "$1" in
+      chatgpt|claude|claude-cli) kind="http" ;;
+      gemini) kind="$SYSTEM_KIND" ;;
+      *)
+        if [ "$MODE" = "system" ]; then kind="$SYSTEM_KIND"; else kind="http"; fi
+        ;;
+    esac
+  fi
+  case "$kind" in
+    socks) USE_SOCKS=1 ;;
+    http) USE_SOCKS=0 ;;
+    *) c_err "无效代理类型: $kind（仅支持 http / socks）"; return 2 ;;
+  esac
+  if [ "$1" = "claude-cli" ] && [ "$USE_SOCKS" -eq 1 ]; then
+    c_err "Claude Code 不支持 SOCKS，请使用 proxy-launch claude-cli（HTTP）。"
+    return 2
+  fi
+}
+
+selected_port() {
+  if [ "$USE_SOCKS" -eq 1 ]; then printf '%s' "$SOCKS_PORT"; else printf '%s' "$PROXY_PORT"; fi
+}
+
+app_names() {
+  # 每行一个应用名，顺序即 -h 中的展示顺序
+  printf '%s\n' claude chatgpt gemini chrome claude-cli codex zsh git npm pip brew curl status env
+}
+
+# 这里通过 macOS 系统代理配置原生 App；Chromium 应用使用独立启动参数。
+needs_system_proxy() {
+  case "$1" in
+    chatgpt|gemini) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# ---- Google 网段直连修复 ----------------------------------------------------
+# Gemini 会用裸 TCP 直连 Google 自有 IP（172.217.x / 142.250.x ...），完全不看系统代理，
+# 在被墙的网络里就卡在 SYN_SENT → 表现为“无法访问网络”。
+# 修法：把这些网段的路由指到 WARP 隧道口（默认 utun4），让它们走 Cloudflare 出去。
+GOOGLE_NETS="172.217.0.0/16 142.250.0.0/15 142.251.0.0/16 216.58.192.0/19 74.125.0.0/16
+108.177.0.0/17 172.253.0.0/16 64.233.160.0/19 209.85.128.0/17 216.239.32.0/19
+66.102.0.0/20 72.14.192.0/18 23.236.48.0/20 199.36.128.0/19 173.194.0.0/16"
+WARP_IF="${WARP_IF:-}"
+LEARNED_FILE="$CONFIG_DIR/learned-cidrs"
+LEARN_PROCS="${LEARN_PROCS:-Gemini ChatGPT}"
+
+# root 下直接执行，普通用户加 sudo
+run_root() {
+  if [ "$(id -u)" -eq 0 ]; then run_cmd "$@"; else run_cmd sudo "$@"; fi
+}
+
+learned_nets() {
+  [ -r "$LEARNED_FILE" ] || return 0
+  awk 'NF && $1 !~ /^#/ {print $1}' "$LEARNED_FILE" | sort -u
+}
+
+all_nets() {
+  printf '%s\n' $GOOGLE_NETS
+  learned_nets
+}
+
+warp_interface() {
+  local i
+  if [ -n "$WARP_IF" ]; then printf '%s' "$WARP_IF"; return 0; fi
+  # 跟随 172.100/24（sharenet 节点网段）所在接口，即 WARP 隧道
+  i="$(netstat -rn 2>/dev/null | awk '$1=="172.100/24"{print $NF; exit}')"
+  printf '%s' "${i:-utun4}"
+}
+
+route_ifc_for() {
+  # 取网段内第一个可用地址（网络地址本身 route get 会落到 default），
+  # 让内核做最长前缀匹配，避免 netstat 缩写格式的坑。
+  local ip
+  ip="$(printf '%s' "${1%%/*}" | awk -F. '{printf "%s.%s.%s.%d", $1,$2,$3,($4+1)%256}')"
+  /sbin/route -n get "$ip" 2>/dev/null | awk '/interface:/{print $2; exit}'
+}
+
+# 注意（2026-11-17 修正）：早期版本把这些网段用内核路由指到 WARP(utun4)，
+# 但 WARP 自身出口是 **CN**（Cloudflare 中国合作网络），导致 Gemini/Antigravity 的
+# gRPC 请求被 Google 判为 "User location is not supported"。
+# 现改为写入 mihomo 的 IP-CIDR 规则（RULE-SET,proxy-ip,PROXY），让流量经 sharenet（CA 出口）。
+IP_RULES_FILE="$MIHOMO_DIR/rules/proxy-ip.yaml"
+
+ip_rules_nets() {
+  [ -r "$IP_RULES_FILE" ] || return 0
+  awk -F"'" '/^[[:space:]]*- /{print $2}' "$IP_RULES_FILE" | sort -u
+}
+
+mihomo_reload() {
+  local uid; uid="$(stat -f %u "$CONFIG_DIR" 2>/dev/null || id -u)"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '+ launchctl kickstart -k gui/%s/%s\n' "$uid" "$AGENT_LABEL"
+    return 0
+  fi
+  launchctl kickstart -k "gui/${uid}/${AGENT_LABEL}" >/dev/null 2>&1 \
+    || c_warn "mihomo 重载失败，可手动: launchctl kickstart -k gui/$(id -u)/${AGENT_LABEL}"
+}
+
+write_ip_rules() {
+  mkdir -p "$MIHOMO_DIR/rules" 2>/dev/null
+  {
+    printf 'payload:\n'
+    local n; for n in "$@"; do printf "  - '%s'\n" "$n"; done
+  } > "$IP_RULES_FILE"
+}
+
+google_routes_present() {
+  local n cur; cur="$(ip_rules_nets)"
+  for n in $(all_nets); do
+    printf '%s\n' "$cur" | grep -qxF "$n" || return 1
+  done
+  return 0
+}
+
+google_routes_on() {
+  local merged; merged="$( { ip_rules_nets; all_nets; } | sort -u )"
+  if [ "$(ip_rules_nets)" != "$merged" ]; then
+    write_ip_rules $merged
+    mihomo_reload
+    [ "$DRY_RUN" -eq 0 ] && c_ok "网段已写入 mihomo IP 规则（经 sharenet，CA 出口）"
+  fi
+  return 0
+}
+
+google_routes_off() {
+  local keep n; keep="$(ip_rules_nets)"
+  for n in $(all_nets); do
+    keep="$(printf '%s\n' "$keep" | grep -vxF "$n")"
+  done
+  if [ "$(ip_rules_nets)" != "$(printf '%s\n' "$keep" | sort -u)" ]; then
+    write_ip_rules $keep
+    mihomo_reload
+    [ "$DRY_RUN" -eq 0 ] && c_ok "网段 IP 规则已移除"
+  fi
+  return 0
+}
+
+google_routes_status() {
+  local n cur; cur="$(ip_rules_nets)"
+  c_info "后端: mihomo IP-CIDR 规则（${IP_RULES_FILE}）→ sharenet/CA"
+  for n in $(all_nets); do
+    if printf '%s\n' "$cur" | grep -qxF "$n"; then
+      printf '  %-18s → PROXY ✅\n' "$n"
+    else
+      printf '  %-18s → 缺失 ❌（proxy-launch routes on）\n' "$n"
+    fi
+  done
+  return 0
+}
+
+# 从 Gemini / ChatGPT 的**直连**（绕过代理）连接里学习新网段，写入 mihomo IP 规则。
+learn_new_nets() {
+  local name pid ip net added=0
+  mkdir -p "$CONFIG_DIR" 2>/dev/null
+  for name in $LEARN_PROCS; do
+    for pid in $(pgrep -x "$name" 2>/dev/null); do
+      lsof -i -nP -a -p "$pid" 2>/dev/null \
+        | awk '/SYN_SENT|ESTABLISHED/ && /:443 \(/ {print $9}' \
+        | sed 's/.*->//; s/:443.*//' \
+        | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || true
+    done
+  done | sort -u | while read -r ip; do
+    case "$ip" in 10.*|127.*|169.254.*|172.1[6-9].*|172.2[0-9].*|172.3[01].*|192.168.*|100.6[4-9].*|100.[7-9][0-9].*|100.1[01][0-9].*|100.12[0-7].*) continue ;; esac
+    net="$(printf '%s' "$ip" | awk -F. '{printf "%s.%s.%s.0/24", $1,$2,$3}')"
+    printf '%s\n' "$(all_nets)" | grep -qxF "$net" && continue
+    grep -qxF "$net" "$LEARNED_FILE" 2>/dev/null && continue
+    printf '%s\n' "$net" >> "$LEARNED_FILE"
+    echo "$(date '+%F %T') learned $net (from $ip)" >> "$CONFIG_DIR/learn.log"
+    added=$((added+1))
+  done
+  if [ "$added" -gt 0 ]; then
+    google_routes_on
+    [ "$DRY_RUN" -eq 0 ] && c_info "新学习 ${added} 个网段，已并入 mihomo IP 规则"
+  fi
+  return 0
+}
+
+# ToDesk 网段：走 WARP(utun4) 国内出口，既显示CN又可达（国内直连不可达、sharenet出口CA）。
+# 内核 /16 路由比 TUN 的 /1 更优先，流量绕开 sing-box 直接进 WARP。
+TODESK_NETS="155.102.0.0/16 43.135.0.0/16 43.132.0.0/16 43.175.0.0/16 43.162.0.0/16 43.174.0.0/16"
+todesk_routes_on() {
+  local n ifc; ifc="$(warp_interface)"
+  [ -n "$ifc" ] || return 0
+  for n in $TODESK_NETS; do
+    [ "$(route_ifc_for "$n")" = "$ifc" ] && continue
+    run_root /sbin/route add -net "$n" -interface "$ifc"
+  done
+  return 0
+}
+
+# 幂等同步：补齐 IP 规则 + 学习 + 日志裁剪 + 系统代理守护（常驻服务周期性调用）
+routes_sync() {
+  google_routes_on || return 1
+  todesk_routes_on
+  learn_new_nets || return 1
+  logs_trim
+  proxy_guard
+  return 0
+}
+
+# WARP 重连会重置系统代理。若 mihomo 在跑而系统代理没指向它，自动改回，
+# 避免 GUI 应用绕过规则网关（国内绕道/裸连被墙）。mihomo 没跑时不动系统代理。
+proxy_guard() {
+  clash_gateway_active || return 0
+  local out svc
+  out="$(scutil --proxy 2>/dev/null)"
+  # 已经正确指向 7890 且无 PAC/SOCKS 干扰 → 不动
+  if printf '%s\n' "$out" | grep -q "HTTPProxy : 127.0.0.1" \
+     && printf '%s\n' "$out" | grep -q "HTTPPort : ${MIHOMO_PORT}" \
+     && printf '%s\n' "$out" | grep -q "HTTPEnable : 1" \
+     && ! printf '%s\n' "$out" | grep -Eq "ProxyAutoConfigEnable : 1|SOCKSEnable : 1"; then
+    return 0
+  fi
+  svc="${PROXY_SERVICE:-$(active_service)}"
+  [ -n "$svc" ] || return 0
+  run_root networksetup -setautoproxystate "$svc" off
+  run_root networksetup -setsocksfirewallproxystate "$svc" off
+  run_root networksetup -setwebproxy       "$svc" 127.0.0.1 "$MIHOMO_PORT"
+  run_root networksetup -setsecurewebproxy "$svc" 127.0.0.1 "$MIHOMO_PORT"
+  run_root networksetup -setwebproxystate   "$svc" on
+  run_root networksetup -setsecurewebproxystate "$svc" on
+  [ "$DRY_RUN" -eq 0 ] && c_ok "系统代理漂移已纠正 → 127.0.0.1:${MIHOMO_PORT}"
+  return 0
+}
+
+# 日志裁剪：随常驻服务每个周期顺手做，不额外增加定时任务。
+# learn.log 只在学到新网段时增长，正常一年也只有几十行；真正会膨胀的是内核日志。
+logs_trim() {
+  local f max keep
+  # 学习日志：超过 500 行只留最后 200 行
+  f="$CONFIG_DIR/learn.log"
+  if [ -f "$f" ] && [ "$(wc -l < "$f" | tr -d ' ')" -gt 500 ]; then
+    tail -n 200 "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+  fi
+  # 内核日志：超过 3 MB 只留最后 1000 行（mihomo 自身不轮转）
+  f="$MIHOMO_DIR/mihomo.log"
+  if [ -f "$f" ] && [ "$(stat -f %z "$f" 2>/dev/null || echo 0)" -gt 3145728 ]; then
+    tail -n 1000 "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+  fi
+  # 常驻服务自身日志：超过 1 MB 只留最后 500 行
+  f="/var/log/proxy-routes.log"
+  if [ -f "$f" ] && [ "$(stat -f %z "$f" 2>/dev/null || echo 0)" -gt 1048576 ]; then
+    tail -n 500 "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+  fi
+  return 0
+}
+
+# ---- Clash(mihomo) 规则分流：国内直连、其余走 sharenet --------------------------
+# 相比 PAC：规则可基于 GEOSITE(域名库) + GEOIP(IP 归属) 判断，且由独立内核统一处理
+# DNS 与连接，不依赖各 App 对 PAC 的支持程度。使用 Clash Verge 自带内核与 geo 数据。
+AGENT_LABEL="com.zyc.sharenet-gateway"
+AGENT_PLIST="$HOME/Library/LaunchAgents/${AGENT_LABEL}.plist"
+# 旧标签（早期版本用过），安装时自动清理
+LEGACY_AGENT_LABELS="com.zyc.proxy-clash"
+
+TUN_LABEL="com.zyc.sharenet-tun"
+TUN_PLIST="/Library/LaunchDaemons/${TUN_LABEL}.plist"
+
+clash_tun_on() {
+  MIHOMO_TUN=1 clash_build || return 1
+  if [ "$DRY_RUN" -eq 1 ]; then printf '+ install root TUN daemon %s\n' "$TUN_PLIST"; return 0; fi
+  # 先停用户级实例释放端口（用配置目录属主的 uid，root 的 id -u=0 停不掉 gui 域）
+  local owner_uid; owner_uid="$(stat -f %u "$CONFIG_DIR" 2>/dev/null || id -u)"
+  launchctl bootout "gui/${owner_uid}/${AGENT_LABEL}" 2>/dev/null || true
+  sleep 1
+  local tmp; tmp="$(mktemp)"
+  cat > "$tmp" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>${TUN_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array><string>${MIHOMO_BIN}</string><string>-d</string><string>${MIHOMO_DIR}</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>${MIHOMO_DIR}/tun.log</string>
+  <key>StandardErrorPath</key><string>${MIHOMO_DIR}/tun.log</string>
+</dict>
+</plist>
+PLIST
+  run_root /bin/cp "$tmp" "$TUN_PLIST" && run_root /bin/chmod 644 "$TUN_PLIST" && rm -f "$tmp"
+  run_root /bin/launchctl bootout system "$TUN_PLIST" >/dev/null 2>&1 || true
+  run_root /bin/launchctl bootstrap system "$TUN_PLIST" || { c_err "TUN daemon 启动失败"; return 1; }
+  sleep 3
+  nc -z -w 2 127.0.0.1 "$MIHOMO_PORT" || { c_err "TUN 模式端口未监听"; return 1; }
+  c_ok "TUN 模式已启用（root daemon，接管全部流量；WARP/sharenet 已排除防环路）"
+  return 0
+}
+
+clash_tun_off() {
+  if [ "$DRY_RUN" -eq 1 ]; then printf '+ remove root TUN daemon, restore user agent\n'; return 0; fi
+  run_root /bin/launchctl bootout system "$TUN_PLIST" >/dev/null 2>&1 || true
+  run_root /bin/rm -f "$TUN_PLIST"
+  MIHOMO_TUN=0 clash_build || return 1
+  clash_agent_install || return 1
+  c_ok "已退出 TUN 模式，恢复用户级 mihomo（仅代理感知流量）"
+  return 0
+}
+
+# ---- sing-box TUN（macOS 更稳的 TUN 实现，推荐）--------------------------------
+# 评估结论(2026-11-17)：sing-box 1.14 在 WARP 嵌套下重启稳定（mihomo TUN 重启会 DNS 环路），
+# 靠 outbound bind_interface 显式绑定（sharenet→utun4、direct→en0）解决上游/环路问题。
+SB_BIN="${SB_BIN:-/opt/homebrew/bin/sing-box}"
+SB_DIR="$CONFIG_DIR/singbox"
+SB_CFG="$SB_DIR/config.json"
+SB_LABEL="com.zyc.sharenet-sb"
+SB_PLIST="/Library/LaunchDaemons/${SB_LABEL}.plist"
+
+sb_build() {
+  [ -x "$SB_BIN" ] || { c_err "未安装 sing-box：brew install sing-box"; return 1; }
+  mkdir -p "$SB_DIR" || return 1
+  local mode; mode="$(cat "$CONFIG_DIR/mode" 2>/dev/null || echo rule)"
+  python3 - "$MIHOMO_DIR/rules" "$SB_CFG" "$mode" <<'PY'
+import json,re,sys,os
+rules,cfgp,mode=sys.argv[1],sys.argv[2],sys.argv[3]
+def load(f):
+    out=[]
+    for line in open(os.path.join(rules,f)):
+        m=re.search(r"'([^']+)'",line)
+        if m: out.append(m.group(1).lstrip('+.'))
+    return out
+direct=load("direct-extra.yaml"); proxy=load("proxy-extra.yaml")
+# 基础规则：sniff + DNS劫持 + 运输层/内网直连（两种模式都必须保留，防环路）
+# 禁 IPv6 + 拒 QUIC(UDP443)：sharenet 代理不支持 IPv6/UDP，Gemini 等优先 IPv6/QUIC 会卡死，强制 IPv4+TCP
+base=[{"action":"sniff"},{"protocol":"dns","action":"hijack-dns"},
+ {"ip_cidr":["172.100.0.0/24","162.159.192.0/21","162.159.137.0/24","162.159.36.0/24","100.64.0.0/10"],"outbound":"direct"},
+ {"ip_is_private":True,"outbound":"direct"},
+ {"ip_cidr":["::/0"],"outbound":"block"},
+ {"protocol":"udp","port":[443],"action":"reject"}]
+if mode=="global":
+    # 全局：除内网/运输层外全部走代理
+    rules=base
+else:
+    # 规则：国内直连 + 显式代理 + geo 兜底
+    rules=base+[{"domain_suffix":direct+["cn"],"outbound":"direct"},
+      {"domain_suffix":proxy,"outbound":"PROXY"},
+      {"rule_set":["geoip-cn","geosite-cn"],"outbound":"direct"}]
+cfg={
+ "log":{"level":"info","timestamp":True},
+ "dns":{"servers":[
+   {"tag":"cn","type":"udp","server":"114.114.114.114","detour":"direct"},
+   {"tag":"foreign","type":"https","server":"1.1.1.1","detour":"PROXY"}],
+  "rules":([] if mode=="global" else [{"domain_suffix":direct+["cn"],"server":"cn"}]),
+  "final":"foreign","strategy":"ipv4_only"},
+ "inbounds":[
+  {"type":"tun","tag":"tun-in","address":["172.19.0.1/30"],
+   "auto_route":True,"strict_route":True,"stack":"system","mtu":9000},
+  {"type":"mixed","tag":"mixed-in","listen":"127.0.0.1","listen_port":7890}],
+ "outbounds":[
+  {"tag":"PROXY","type":"urltest","outbounds":["sharenet-socks","sharenet-http"],
+   "url":"https://www.gstatic.com/generate_204","interval":"300s"},
+  {"tag":"sharenet-socks","type":"socks","server":"172.100.0.2","server_port":1080,"version":"5","bind_interface":"utun4"},
+  {"tag":"sharenet-http","type":"http","server":"172.100.0.2","server_port":8443,"bind_interface":"utun4"},
+  {"tag":"direct","type":"direct","bind_interface":"en0"},
+  {"tag":"block","type":"block"}],
+ "route":{"rules":rules,
+  "rule_set":[
+   {"tag":"geoip-cn","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-cn.srs","download_detour":"PROXY"},
+   {"tag":"geosite-cn","type":"remote","format":"binary","url":"https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-cn.srs","download_detour":"PROXY"}],
+  "final":"PROXY","auto_detect_interface":True,"default_domain_resolver":"cn"},
+ "experimental":{"cache_file":{"enabled":True}}}
+json.dump(cfg,open(cfgp,"w"),indent=2,ensure_ascii=False)
+print("sb config written, mode="+mode)
+PY
+  "$SB_BIN" check -c "$SB_CFG" >/dev/null 2>&1 && c_ok "sing-box 配置校验通过（mode=${mode}）" || { c_err "sing-box 配置校验失败"; return 1; }
+}
+
+# 模式切换：global=全走代理 / rule=国内直连分流
+set_mode() {
+  local m="$1"
+  case "$m" in global|rule) ;; *) c_err "mode 只接受 global / rule"; return 2;; esac
+  printf '%s\n' "$m" > "$CONFIG_DIR/mode"
+  sb_build || return 1
+  if launchctl print "system/${SB_LABEL}" >/dev/null 2>&1; then
+    run_root /bin/launchctl kickstart -k "system/${SB_LABEL}"
+    c_ok "已切换为 ${m} 模式并重载 sing-box"
+  else
+    c_ok "已设为 ${m} 模式（sing-box 未运行，sb on 后生效）"
+  fi
+}
+
+sb_on() {
+  sb_build || return 1
+  if [ "$DRY_RUN" -eq 1 ]; then printf '+ install root sing-box TUN %s\n' "$SB_PLIST"; return 0; fi
+  local owner_uid; owner_uid="$(stat -f %u "$CONFIG_DIR" 2>/dev/null || id -u)"
+  launchctl bootout "gui/${owner_uid}/${AGENT_LABEL}" 2>/dev/null || true   # 停 mihomo 释放7890
+  launchctl bootout system "$TUN_PLIST" 2>/dev/null || true               # 停 mihomo TUN(若存在)
+  sleep 1
+  local tmp; tmp="$(mktemp)"
+  cat > "$tmp" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>${SB_LABEL}</string>
+<key>ProgramArguments</key><array><string>${SB_BIN}</string><string>run</string><string>-c</string><string>${SB_CFG}</string><string>-D</string><string>${SB_DIR}</string></array>
+<key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
+<key>StandardOutPath</key><string>${SB_DIR}/sb.log</string>
+<key>StandardErrorPath</key><string>${SB_DIR}/sb.log</string>
+</dict></plist>
+PLIST
+  run_root /bin/cp "$tmp" "$SB_PLIST" && run_root /bin/chmod 644 "$SB_PLIST" && rm -f "$tmp"
+  run_root /bin/launchctl bootout system "$SB_PLIST" >/dev/null 2>&1 || true
+  run_root /bin/launchctl bootstrap system "$SB_PLIST" || { c_err "sing-box daemon 启动失败"; return 1; }
+  sleep 3
+  nc -z -w 2 127.0.0.1 "$MIHOMO_PORT" || { c_err "sing-box 7890 未监听"; return 1; }
+  c_ok "sing-box TUN 已启用（root 常驻，接管全部流量，重启稳定）"
+  return 0
+}
+
+sb_off() {
+  if [ "$DRY_RUN" -eq 1 ]; then printf '+ remove sing-box TUN, restore user mihomo\n'; return 0; fi
+  run_root /bin/launchctl bootout system "$SB_PLIST" >/dev/null 2>&1 || true
+  run_root /bin/rm -f "$SB_PLIST"
+  MIHOMO_TUN=0 clash_build || return 1
+  clash_agent_install || return 1
+  c_ok "已退出 sing-box TUN，恢复用户级 mihomo"
+  return 0
+}
+
+sb_status() {
+  printf '  sing-box: %s\n' "$SB_BIN"
+  if launchctl print "system/${SB_LABEL}" >/dev/null 2>&1; then
+    c_ok "sing-box TUN 运行中"
+  else
+    c_warn "sing-box TUN 未运行"
+  fi
+  nc -z -w 1 127.0.0.1 "$MIHOMO_PORT" >/dev/null 2>&1 && c_ok "7890 监听中" || c_warn "7890 未监听"
+  return 0
+}
+
+# JSON 状态，供菜单栏 GUI 读取（快速，不做网络请求）
+status_json() {
+  local sb=0 tun=0 mu=0 warp=0 port=0 sys=0 route=0
+  launchctl print "system/${SB_LABEL}" >/dev/null 2>&1 && sb=1
+  launchctl print "system/${TUN_LABEL}" >/dev/null 2>&1 && tun=1
+  launchctl print "gui/$(id -u)/${AGENT_LABEL}" >/dev/null 2>&1 && mu=1
+  "/Applications/Cloudflare WARP.app/Contents/Resources/warp-cli" status 2>/dev/null | head -1 | grep -q Connected && warp=1
+  nc -z -w 1 127.0.0.1 "$MIHOMO_PORT" >/dev/null 2>&1 && port=1
+  scutil --proxy 2>/dev/null | grep -q "HTTPEnable : 1" && sys=1
+  netstat -rn 2>/dev/null | grep -q "172.100/24" && route=1
+  local mode; mode="$(cat "$CONFIG_DIR/mode" 2>/dev/null || echo rule)"
+  printf '{"sb":%d,"tun":%d,"mihomo":%d,"warp":%d,"port":%d,"sysproxy":%d,"route":%d,"mode":"%s"}\n' "$sb" "$tun" "$mu" "$warp" "$port" "$sys" "$route" "$mode"
+}
+
+# ---- 总开关：off=纯直连（关 sb+mihomo+系统代理），on=恢复 sing-box TUN ----------
+# 依赖关系：WARP 只是 sharenet 的运输层；sb TUN 接管默认路由。
+# 只关 WARP 不关 sb → 境外上游失效(境外断)、国内仍直连，不会全断网。
+# 要纯直连必须关 sb(否则它仍接管路由)并关系统代理；WARP 可关可不关。
+all_off() {
+  if [ "$DRY_RUN" -eq 1 ]; then printf '+ stop sb/mihomo, disable system proxy (pure direct)\n'; return 0; fi
+  local owner_uid; owner_uid="$(stat -f %u "$CONFIG_DIR" 2>/dev/null || id -u)"
+  run_root /bin/launchctl bootout system "$SB_PLIST" >/dev/null 2>&1 || true
+  run_root /bin/launchctl bootout system "$TUN_PLIST" >/dev/null 2>&1 || true
+  launchctl bootout "gui/${owner_uid}/${AGENT_LABEL}" 2>/dev/null || true
+  local svc; svc="${PROXY_SERVICE:-$(active_service)}"
+  run_root networksetup -setwebproxystate       "$svc" off
+  run_root networksetup -setsecurewebproxystate "$svc" off
+  run_root networksetup -setsocksfirewallproxystate "$svc" off
+  run_root networksetup -setautoproxystate      "$svc" off
+  c_ok "已关闭全部代理 → 纯直连（国内正常，境外按墙的现状）。WARP 可另关：warp-cli disconnect"
+  return 0
+}
+
+all_on() {
+  sb_on || return 1
+  local svc; svc="${PROXY_SERVICE:-$(active_service)}"
+  run_root networksetup -setwebproxy       "$svc" 127.0.0.1 "$MIHOMO_PORT"
+  run_root networksetup -setsecurewebproxy "$svc" 127.0.0.1 "$MIHOMO_PORT"
+  run_root networksetup -setwebproxystate   "$svc" on
+  run_root networksetup -setsecurewebproxystate "$svc" on
+  c_ok "已恢复 sing-box TUN 分流"
+  return 0
+}
+
+clash_gateway_active() {
+  nc -z -w 1 127.0.0.1 "$MIHOMO_PORT" >/dev/null 2>&1
+}
+
+clash_build() {
+  [ -x "$MIHOMO_BIN" ] || { c_err "找不到 mihomo: ${MIHOMO_BIN}"; return 1; }
+  mkdir -p "$MIHOMO_DIR/rules" || return 1
+  [ -f "$IP_RULES_FILE" ] || printf 'payload: []\n' > "$IP_RULES_FILE"
+  # TUN 模式（MIHOMO_TUN=1）：接管全部流量（含绕过代理的裸 socket/gRPC），
+  # 排除 WARP 隧道端点与 sharenet 私网，避免环路。需 root 运行。
+  local TUN_BLOCK="" PROXY_IF=""
+  if [ "${MIHOMO_TUN:-0}" = "1" ]; then
+    PROXY_IF="    interface-name: utun4"
+    TUN_BLOCK='tun:
+  enable: true
+  stack: system
+  auto-route: true
+  auto-detect-interface: true
+  dns-hijack: [any:53, "tcp://any:53"]
+  route-exclude-address:
+    - 172.100.0.0/24
+    - 162.159.192.0/21
+    - 162.159.137.0/24
+    - 162.159.36.0/24
+    - 10.0.0.0/8
+    - 172.16.0.0/12
+    - 192.168.0.0/16
+    - 100.64.0.0/10
+    - 2606:4700:102::/48'
+  fi
+  for f in geoip.dat geosite.dat; do
+    if [ -f "$MIHOMO_GEO_SRC/$f" ] && [ ! -f "$MIHOMO_DIR/$f" ]; then
+      cp "$MIHOMO_GEO_SRC/$f" "$MIHOMO_DIR/$f" || c_warn "复制 $f 失败，规则可能降级"
+    fi
+  done
+  # ---- 规则清单（参考 饿饭加速器 custom_routing_rules.json 与 Clash 订阅写法）----
+  cat > "$MIHOMO_DIR/rules/direct-extra.yaml" <<'DIRECT'
+payload:
+  # 高校与科研
+  - '+.edu.cn'
+  - '+.ac.cn'
+  - '+.ustc.edu.cn'
+  - '+.cernet.edu.cn'
+  - '+.paratera.com'
+  # 国内大模型平台
+  - '+.deepseek.com'
+  - '+.moonshot.cn'
+  - '+.moonshot.com'
+  - '+.kimi.com'
+  - '+.bigmodel.cn'
+  - '+.zhipuai.cn'
+  - '+.chatglm.cn'
+  - '+.tongyi.aliyun.com'
+  - '+.aliyuncs.com'
+  - '+.baidubce.com'
+  - '+.baidu.com'
+  # B站（含直播推流 bilivideo，geosite 未收录需显式直连）
+  - '+.bilibili.com'
+  - '+.bilivideo.com'
+  - '+.hdslb.com'
+  - '+.biliapi.net'
+  - '+.biligame.com'
+  - '+.volces.com'
+  - '+.volcengine.com'
+  - '+.volcengineapi.com'
+  - '+.doubao.com'
+  - '+.hunyuan.cloud.tencent.com'
+  - '+.tencentcloudapi.com'
+  - '+.xfyun.cn'
+  - '+.xf-yun.com'
+  - '+.minimaxi.com'
+  - '+.baichuan-ai.com'
+  - '+.stepfun.com'
+  - '+.sensenova.com'
+  - '+.siliconflow.cn'
+  - '+.lingyiwanwu.com'
+  - '+.modelscope.cn'
+  - '+.openxlab.org.cn'
+  - '+.hf-mirror.com'
+  # 学术出版与检索
+  - '+.sciencedirect.com'
+  - '+.ieee.org'
+  - '+.springer.com'
+  - '+.nature.com'
+  - '+.wiley.com'
+  - '+.tandfonline.com'
+  - '+.clarivate.com'
+  - '+.webofscience.com'
+  - '+.jstor.org'
+  - '+.acs.org'
+  - '+.aps.org'
+  - '+.iop.org'
+  - '+.sagepub.com'
+  - '+.cambridge.org'
+  - '+.oup.com'
+  # 会议与办公（国内节点）
+  - '+.meeting.tencent.com'
+  - '+.meeting.qq.com'
+  - '+.wemeet.tencent.com'
+  - '+.voovmeeting.com'
+  - '+.wondershare.cn'
+  - '+.edrawmax.cn'
+  # 微软中国
+  - '+.microsoftonline.cn'
+  - '+.partner.microsoftonline.cn'
+  - '+.sharepoint.cn'
+  - '+.microsoft365.cn'
+  - '+.azure.cn'
+  - 'cn.bing.com'
+DIRECT
+  cat > "$MIHOMO_DIR/rules/proxy-extra.yaml" <<'PROXY'
+payload:
+  # 国外 AI
+  - '+.openai.com'
+  - '+.chatgpt.com'
+  - '+.oaistatic.com'
+  - '+.oaiusercontent.com'
+  - '+.sora.com'
+  - '+.anthropic.com'
+  - '+.claude.ai'
+  - '+.x.ai'
+  - '+.gemini.google.com'
+  - '+.perplexity.ai'
+  - '+.mistral.ai'
+  - '+.cohere.ai'
+  - '+.meta.ai'
+  - '+.huggingface.co'
+  - '+.hf.co'
+  - '+.openrouter.ai'
+  - '+.groq.com'
+  - '+.together.ai'
+  # Google 全家桶
+  - '+.google.com'
+  - '+.googleapis.com'
+  - '+.gstatic.com'
+  - '+.googleusercontent.com'
+  - '+.googlevideo.com'
+  - '+.youtube.com'
+  - '+.ggpht.com'
+  # 开发与包管理
+  - '+.github.com'
+  - '+.githubusercontent.com'
+  - '+.githubcopilot.com'
+  - '+.cursor.com'
+  - '+.npmjs.com'
+  - '+.npmjs.org'
+  - '+.pypi.org'
+  - '+.docker.io'
+  # 微软国际版与社交
+  - '+.onedrive.com'
+  - '+.live.com'
+  - '+.livefilestore.com'
+  - '+.sharepoint.com'
+  - '+.microsoft.com'
+  - '+.microsoftonline.com'
+  - '+.office.com'
+  - '+.outlook.com'
+  - '+.azure.com'
+  - '+.windows.net'
+  - '+.msn.com'
+  - '+.bing.com'
+  - '+.x.com'
+  - '+.twitter.com'
+  - '+.discord.com'
+  - '+.telegram.org'
+PROXY
+  cat > "$MIHOMO_CFG" <<YAML
+# 由 proxy-launch 生成 —— sharenet 规则分流（国内直连 / 其余走隧道）
+mixed-port: ${MIHOMO_PORT}
+allow-lan: false
+bind-address: 127.0.0.1
+mode: rule
+log-level: warning
+ipv6: false
+unified-delay: true
+tcp-concurrent: true
+external-controller: ${MIHOMO_API}
+find-process-mode: "off"
+geodata-mode: true
+geo-auto-update: false
+${TUN_BLOCK}
+
+rule-providers:
+  direct-extra:
+    type: file
+    behavior: domain
+    format: yaml
+    path: ./rules/direct-extra.yaml
+  proxy-extra:
+    type: file
+    behavior: domain
+    format: yaml
+    path: ./rules/proxy-extra.yaml
+  proxy-ip:
+    type: file
+    behavior: ipcidr
+    format: yaml
+    path: ./rules/proxy-ip.yaml
+
+dns:
+  enable: true
+  listen: 127.0.0.1:${MIHOMO_DNS_PORT:-1053}
+  ipv6: false
+  enhanced-mode: redir-host
+  # 国内 DNS 用 114：AliDNS/DNSPod 对 y.qq.com 等会返回腾讯 EdgeOne 境外节点
+  # (43.171.x)，从 CN 直连超时；114 返回可达的国内节点。
+  nameserver:
+    - 114.114.114.114
+    - 223.5.5.5
+  nameserver-policy:
+    "geosite:geolocation-!cn": "https://1.1.1.1/dns-query#PROXY"
+    "geosite:cn,private": "114.114.114.114"
+
+proxies:
+  - name: sharenet-socks
+    type: socks5
+    server: ${PROXY_HOST}
+    port: ${SOCKS_PORT}
+    udp: false
+${PROXY_IF}
+  - name: sharenet-http
+    type: http
+    server: ${PROXY_HOST}
+    port: ${PROXY_PORT}
+${PROXY_IF}
+
+proxy-groups:
+  - name: PROXY
+    type: fallback
+    url: https://www.gstatic.com/generate_204
+    interval: 300
+    tolerance: 50
+    proxies: [sharenet-socks, sharenet-http]
+
+rules:
+  - DOMAIN,cn.bing.com,DIRECT
+  - RULE-SET,proxy-extra,PROXY
+  - RULE-SET,proxy-ip,PROXY
+  - RULE-SET,direct-extra,DIRECT
+  - GEOIP,lan,DIRECT,no-resolve
+  - DOMAIN-SUFFIX,cn,DIRECT
+  - GEOSITE,cn,DIRECT
+  - GEOSITE,private,DIRECT
+  - GEOIP,CN,DIRECT
+  - GEOSITE,geolocation-!cn,PROXY
+  - MATCH,PROXY
+YAML
+  c_ok "mihomo 配置已生成: ${MIHOMO_CFG}"
+  "$MIHOMO_BIN" -t -d "$MIHOMO_DIR" >/tmp/mihomo-test.log 2>&1 \
+    && c_ok "配置校验通过" || { c_err "配置校验失败："; tail -5 /tmp/mihomo-test.log; return 1; }
+  return 0
+}
+
+clash_agent_install() {
+  local tmp oldp; tmp="$(mktemp)"
+  if [ "$DRY_RUN" -eq 0 ]; then
+    for oldp in $LEGACY_AGENT_LABELS; do
+      if [ -f "$HOME/Library/LaunchAgents/${oldp}.plist" ]; then
+        launchctl bootout "gui/$(id -u)/${oldp}" 2>/dev/null || true
+        rm -f "$HOME/Library/LaunchAgents/${oldp}.plist"
+        c_info "已清理旧登录项 ${oldp}"
+      fi
+    done
+  fi
+  cat > "$tmp" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>${AGENT_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${MIHOMO_BIN}</string>
+    <string>-d</string>
+    <string>${MIHOMO_DIR}</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>${MIHOMO_DIR}/mihomo.log</string>
+  <key>StandardErrorPath</key><string>${MIHOMO_DIR}/mihomo.log</string>
+</dict>
+</plist>
+PLIST
+  if [ "$DRY_RUN" -eq 1 ]; then printf '+ install %s\n' "$AGENT_PLIST"; rm -f "$tmp"; return 0; fi
+  mkdir -p "$HOME/Library/LaunchAgents"
+  cp "$tmp" "$AGENT_PLIST" && rm -f "$tmp" || { c_err "写入 ${AGENT_PLIST} 失败（检查属主）"; return 1; }
+  launchctl bootout "gui/$(id -u)/${AGENT_LABEL}" 2>/dev/null || true
+  launchctl bootstrap "gui/$(id -u)" "$AGENT_PLIST" && c_ok "mihomo 已作为登录项启动（KeepAlive）"
+}
+
+clash_on() {
+  clash_build || return 1
+  if [ "$DRY_RUN" -eq 0 ]; then
+    if [ "$(id -u)" -eq 0 ]; then
+      # launchd 的 GUI 域属于登录用户，root 无法 bootstrap；登录项需以用户身份安装
+      c_warn "以 root 运行，跳过登录项安装（若未装过，请以当前用户执行 proxy-launch clash agent）"
+    else
+      clash_agent_install || return 1
+    fi
+    sleep 2
+    nc -z -w 2 127.0.0.1 "$MIHOMO_PORT" || { c_err "mihomo 端口 ${MIHOMO_PORT} 未监听（先执行 proxy-launch clash agent）"; return 1; }
+  else
+    clash_agent_install
+  fi
+  # 系统代理指向本地 mihomo（HTTP 与 HTTPS 同一端口）
+  local svc; svc="${PROXY_SERVICE:-$(active_service)}"
+  run_root networksetup -setautoproxystate "$svc" off
+  run_root networksetup -setsocksfirewallproxystate "$svc" off
+  run_root networksetup -setwebproxy         "$svc" 127.0.0.1 "$MIHOMO_PORT"
+  run_root networksetup -setsecurewebproxy   "$svc" 127.0.0.1 "$MIHOMO_PORT"
+  run_root networksetup -setwebproxystate    "$svc" on
+  run_root networksetup -setsecurewebproxystate "$svc" on
+  [ "$DRY_RUN" -eq 0 ] && c_ok "规则分流已启用：系统代理 → 127.0.0.1:${MIHOMO_PORT}（国内直连 / 其余走 sharenet）"
+  return 0
+}
+
+clash_off() {
+  local svc; svc="${PROXY_SERVICE:-$(active_service)}"
+  if [ "$DRY_RUN" -eq 0 ]; then
+    launchctl bootout "gui/$(id -u)/${AGENT_LABEL}" 2>/dev/null || true
+    rm -f "$AGENT_PLIST"
+  fi
+  # 回到静态 HTTP/HTTPS 代理（已知可用状态）
+  run_root networksetup -setautoproxystate "$svc" off
+  run_root networksetup -setwebproxy       "$svc" "$PROXY_HOST" "$PROXY_PORT"
+  run_root networksetup -setsecurewebproxy "$svc" "$PROXY_HOST" "$PROXY_PORT"
+  run_root networksetup -setwebproxystate   "$svc" on
+  run_root networksetup -setsecurewebproxystate "$svc" on
+  [ "$DRY_RUN" -eq 0 ] && c_ok "已关闭规则分流，恢复静态 HTTP/HTTPS 代理"
+  return 0
+}
+
+clash_status() {
+  local svc; svc="${PROXY_SERVICE:-$(active_service)}"
+  printf '  内核: %s\n' "$MIHOMO_BIN"
+  printf '  配置: %s %s\n' "$MIHOMO_CFG" "$([ -f "$MIHOMO_CFG" ] && echo 存在 || echo 缺失)"
+  printf '  端口 7890: '
+  nc -z -w 2 127.0.0.1 "$MIHOMO_PORT" >/dev/null 2>&1 && c_ok "监听中" || c_warn "未监听"
+  if launchctl print "gui/$(id -u)/${AGENT_LABEL}" >/dev/null 2>&1; then
+    c_ok "登录项运行中（${AGENT_LABEL}）"
+  else
+    c_warn "登录项未安装（proxy-launch clash on 会安装）"
+  fi
+  c_info "系统代理（${svc}）:"
+  scutil --proxy | grep -Ei "HTTPEnable|HTTPSEnable|HTTPProxy|HTTPPort|SOCKSEnable|ProxyAutoConfigEnable" | sed 's/^/    /'
+  return 0
+}
+
+# ---- PAC：按域名分流（国内直连，其余走 sharenet）--------------------------------
+# 静态系统代理没有规则，访问国内站点会绕道 Toronto（实测慢 2s+）。
+# PAC 让浏览器/系统对每个请求先判断：命中国内域名 → DIRECT，否则 → PROXY。
+PAC_FILE="$CONFIG_DIR/proxy.pac"
+
+# 国内域名后缀（含 .cn 覆盖大部分），刻意保持精简：PAC 是线性匹配，条目越多越慢
+CN_SUFFIXES=".cn .com.cn .net.cn .org.cn .gov.cn .edu.cn
+.baidu.com .bdstatic.com .bdimg.com .qq.com .gtimg.com .qpic.cn .qlogo.cn .weixin.qq.com
+.wechat.com .tencent.com .taobao.com .tmall.com .alicdn.com .aliyun.com .alipay.com
+.alibaba.com .1688.com .jd.com .360buyimg.com .bilibili.com .hdslb.com .biligame.com
+.sina.com .weibo.com .wcdn.cn .sinaimg.cn .163.com .126.net .netease.com .youdao.com
+.zhihu.com .zhimg.com .douban.com .douyin.com .bytedance.com .bytecdn.cn .pstatp.com
+.toutiao.com .ixigua.com .kuaishou.com .iqiyi.com .youku.com .sohu.com .csdn.net
+.csdnimg.cn .oschina.net .gitee.com .cnblogs.com .jianshu.com .segmentfault.com
+.xiaomi.com .mi.com .miui.com .huawei.com .hicloud.com .oppo.com .vivo.com
+.meituan.com .dianping.com .ele.me .ctrip.com .qunar.com .12306.cn .didiglobal.com
+.xiecheng.com .ke.com .lianjia.com .58.com .anjuke.com .autohome.com.cn
+.pinduoduo.com .yangkeduo.com .xiaohongshu.com .xhscdn.com .smzdm.com .vip.com
+.icourse163.org .chaoxing.com .zhihuishu.com .xuetangx.com .cnki.net .wanfangdata.com.cn
+.ustc.edu.cn .edu.cn .gov.cn .miit.gov.cn .people.com.cn .xinhuanet.com .cctv.com
+.chinadaily.com.cn .huanqiu.com .thepaper.cn .caixin.com .eastmoney.com .hexun.com
+.10jqka.com.cn .sse.com.cn .szse.cn .alipayobjects.com .alikunlun.com .kunlun.com
+.netease.im .hunyuan.tencent.com .map.baidu.com .amap.com .autonavi.com
+.umeng.com .jpush.cn .getui.com .qiniu.com .qiniucdn.com .upyun.com .jianguoyun.com
+.zhihu.com .zcool.com.cn .gcores.com .hupu.com .doubanio.com .dongqiudi.com"
+
+pac_build() {
+  local i
+  mkdir -p "$CONFIG_DIR"
+  {
+    printf '// 由 proxy-launch 生成，勿手改（改 CN_SUFFIXES 后重跑 proxy-launch pac build）\n'
+    printf '// 规则：本地/内网/国内域名 → DIRECT；其余 → PROXY (sharenet %s)\n' "${PROXY_HOST}:${PROXY_PORT}"
+    printf 'var CN = [\n'
+    for i in $CN_SUFFIXES; do printf "  '%s',\n" "$i"; done
+    printf '];\n'
+    cat <<'JS'
+function _hasSuffix(host, s) {
+  return host.length > s.length && host.substring(host.length - s.length) === s;
+}
+function _isPrivate(host) {
+  return /^(10\.|127\.|169\.254\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.)/.test(host);
+}
+function FindProxyForURL(url, host) {
+  host = host.toLowerCase();
+  if (isPlainHostName(host) || host === 'localhost') return 'DIRECT';
+  if (_isPrivate(host)) return 'DIRECT';
+  for (var i = 0; i < CN.length; i++) {
+    if (_hasSuffix(host, CN[i])) return 'DIRECT';
+  }
+  return 'PROXY PROXYHOST; DIRECT';
+}
+JS
+  } > "$PAC_FILE"
+  sed -i '' "s/PROXYHOST/${PROXY_HOST}:${PROXY_PORT}/" "$PAC_FILE"
+  c_ok "PAC 已生成: ${PAC_FILE}（$(wc -l < "$PAC_FILE" | tr -d ' ') 行）"
+}
+
+pac_on() {
+  local svc; svc="${PROXY_SERVICE:-$(active_service)}"
+  [ -f "$PAC_FILE" ] || pac_build
+  # PAC + 静态代理不能同时开，否则静态优先、规则失效
+  run_root networksetup -setwebproxystate       "$svc" off
+  run_root networksetup -setsecurewebproxystate "$svc" off
+  run_root networksetup -setsocksfirewallproxystate "$svc" off
+  run_root networksetup -setautoproxyurl "$svc" "file://${PAC_FILE}"
+  run_root networksetup -setautoproxystate "$svc" on
+  [ "$DRY_RUN" -eq 0 ] && c_ok "PAC 分流已启用（${svc}）：国内直连，其余走 ${PROXY_HOST}:${PROXY_PORT}"
+  return 0
+}
+
+pac_off() {
+  local svc; svc="${PROXY_SERVICE:-$(active_service)}"
+  run_root networksetup -setautoproxystate "$svc" off
+  # 回到已知可用的静态 HTTP/HTTPS 代理
+  run_root networksetup -setwebproxy       "$svc" "$PROXY_HOST" "$PROXY_PORT"
+  run_root networksetup -setsecurewebproxy "$svc" "$PROXY_HOST" "$PROXY_PORT"
+  run_root networksetup -setwebproxystate   "$svc" on
+  run_root networksetup -setsecurewebproxystate "$svc" on
+  [ "$DRY_RUN" -eq 0 ] && c_ok "PAC 已关闭，恢复静态 HTTP/HTTPS 代理"
+  return 0
+}
+
+pac_status() {
+  local svc; svc="${PROXY_SERVICE:-$(active_service)}"
+  printf '  服务: %s\n' "$svc"
+  printf '  PAC 文件: %s %s\n' "$PAC_FILE" "$([ -f "$PAC_FILE" ] && echo "存在" || echo "缺失")"
+  scutil --proxy | grep -Ei "ProxyAutoConfigURLString|ProxyAutoConfigEnable|HTTPEnable|HTTPSEnable|SOCKSEnable" | sed 's/^/  /'
+  return 0
+}
+
+# ---- 常驻服务（LaunchDaemon，以 root 运行，替换开机/重连后丢失的路由）--------
+DAEMON_LABEL="com.zyc.proxy-routes"
+DAEMON_PLIST="/Library/LaunchDaemons/${DAEMON_LABEL}.plist"
+DAEMON_WRAPPER="/usr/local/bin/proxy-routes-sync"
+DAEMON_INTERVAL="${DAEMON_INTERVAL:-300}"
+
+routes_daemon_install() {
+  local tmpw tmpp owner self abs_cfg
+  # 配置目录的真实属主（用 osascript 以 root 安装时不能用 id -un）
+  owner="$(stat -f '%Su' "$CONFIG_DIR" 2>/dev/null || id -un)"
+  [ -n "$owner" ] || owner="$(id -un)"
+  self="$SELF"; abs_cfg="$CONFIG_DIR"; abs_parent="$(dirname "$CONFIG_DIR")"
+  tmpw="$(mktemp)"; tmpp="$(mktemp)"
+  cat > "$tmpw" <<WRAPPER
+#!/bin/sh
+# 由 LaunchDaemon 以 root 周期调用：保持 Google 网段路由指向 WARP 隧道
+# 隧道不在（WARP 断开）时直接跳过，避免无意义报错
+netstat -rn 2>/dev/null | grep -q '^172\.100/24' || exit 0
+XDG_CONFIG_HOME="${abs_parent}" "${self}" routes sync
+[ -d "${abs_cfg}" ] && chown -R "${owner}" "${abs_cfg}" 2>/dev/null
+exit 0
+WRAPPER
+  cat > "$tmpp" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>${DAEMON_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/sh</string>
+    <string>${DAEMON_WRAPPER}</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>StartInterval</key><integer>${DAEMON_INTERVAL}</integer>
+  <key>StandardOutPath</key><string>/var/log/proxy-routes.log</string>
+  <key>StandardErrorPath</key><string>/var/log/proxy-routes.log</string>
+</dict>
+</plist>
+PLIST
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '+ install %s (every %ss) and %s\n' "$DAEMON_PLIST" "$DAEMON_INTERVAL" "$DAEMON_WRAPPER"
+    rm -f "$tmpw" "$tmpp"; exit 0
+  fi
+  # 文件按当前用户身份生成，只有落盘与 launchctl 需要 root（一次授权）
+  local cmd
+  cmd="cp '$tmpw' '$DAEMON_WRAPPER' && chmod 755 '$DAEMON_WRAPPER' \
+&& cp '$tmpp' '$DAEMON_PLIST' && chmod 644 '$DAEMON_PLIST' \
+&& (launchctl bootout system '$DAEMON_PLIST' >/dev/null 2>&1 || true) \
+&& launchctl bootstrap system '$DAEMON_PLIST'"
+  if [ "$(id -u)" -eq 0 ]; then run_cmd /bin/sh -c "$cmd" || return 1
+  else run_cmd sudo /bin/sh -c "$cmd" || return 1; fi
+  rm -f "$tmpw" "$tmpp"
+  c_ok "常驻服务已安装：每 ${DAEMON_INTERVAL}s 检查并补齐路由（日志 /var/log/proxy-routes.log）"
+  return 0
+}
+
+routes_daemon_uninstall() {
+  local cmd
+  cmd="launchctl bootout system '$DAEMON_PLIST' >/dev/null 2>&1 || true
+rm -f '$DAEMON_PLIST' '$DAEMON_WRAPPER'"
+  if [ "$DRY_RUN" -eq 1 ]; then printf '+ %s\n' "$cmd"; exit 0; fi
+  if [ "$(id -u)" -eq 0 ]; then run_cmd /bin/sh -c "$cmd" || return 1
+  else run_cmd sudo /bin/sh -c "$cmd" || return 1; fi
+  c_ok "常驻服务已卸载"
+  return 0
+}
+
+routes_daemon_status() {
+  if launchctl print "system/${DAEMON_LABEL}" >/dev/null 2>&1; then
+    c_ok "常驻服务运行中（${DAEMON_LABEL}）"
+    launchctl print "system/${DAEMON_LABEL}" 2>/dev/null | grep -E "state|last exit|program|run interval" | sed 's/^/  /'
+  else
+    c_warn "常驻服务未安装/未运行；用 proxy-launch routes install 安装"
+  fi
+  return 0
+}
+
+usage() {
+  local P; P="$(proxy_url)"
+  cat <<EOF
+proxy-launch —— ChatGPT 和 Claude 默认 HTTP
+
+用法:
+  proxy-launch <应用名> [参数...]     启动应用并让它走代理
+  proxy-launch -h                    显示本帮助
+  proxy-launch -l                    只列出应用名（便于脚本/补全）
+  proxy-launch -d <应用名>           只打印将要执行的命令，不真的启动
+  proxy-launch status                检查隧道连通性、出口 IP、系统代理状态
+  proxy-launch sb on|off|build|status
+                                     sing-box TUN（推荐：macOS 重启稳定，接管全部流量含裸socket）
+  proxy-launch pac build|on|off|status
+                                     PAC 分流：国内域名直连、其余走代理（取代静态系统代理）
+  proxy-launch routes on|off|sync|learn|status|install|uninstall|daemon
+                                     Google 网段路由维护（Gemini 这类直连 App 的修复）
+                                     on 补齐 / off 移除 / sync 补齐+学习 / learn 只学习
+                                     status 查看 / install 装常驻服务 / uninstall 卸载 / daemon 看服务状态
+  proxy-launch -s <应用名>           额外写入系统代理（需要 sudo），全局生效
+  proxy-launch --default http|socks 设定其他应用的系统代理默认类型
+  proxy-launch --off                 关闭系统代理（不恢复历史配置）
+
+选项:
+  -h, --help     显示帮助
+  -l, --list     列出可用应用名
+  -d, --dry-run  预演，不执行
+  -s, --system   先用 sudo 写入所选类型的系统代理，再启动应用
+  -S, --socks    本次改用 SOCKS5 (${PROXY_HOST}:${SOCKS_PORT})
+  -H, --http     本次改用 HTTP (${PROXY_HOST}:${PROXY_PORT})
+      --default  http|socks  设定系统代理默认类型（写 ${CONFIG_FILE}）
+      --off      关闭系统代理
+
+可用应用（proxy-launch -h 之外的第二个参数起原样传给应用）:
+  claude      Claude 桌面端（Electron，用 --proxy-server 启动）
+  chatgpt     ChatGPT 桌面端（默认自动开启系统 HTTP/HTTPS 代理）
+  gemini      Gemini 桌面端（自动开启系统代理，类型读取 --default）
+  chrome      Google Chrome（独立 profile，不影响日常窗口）
+  claude-cli  终端里的 Claude Code（export 代理变量后 exec claude）
+  codex       终端里的 Codex CLI
+  zsh         开一个已经设好代理变量的新 shell（最通用）
+  git         git（本次调用的 http.proxy，不改全局 config）
+  npm / pip / brew   对应包管理器
+  curl        curl（加 -x，后面跟普通 curl 参数与 URL）
+  status      诊断：隧道/出口 IP/系统代理现状
+  routes      Google 网段路由：on 添加 / off 移除 / status 查看（默认 status）
+  env         只打印代理环境变量，供 eval 使用
+
+示例:
+  proxy-launch claude                       # Claude 桌面端走 HTTP 8443
+  proxy-launch chatgpt                      # ChatGPT 走系统 HTTP 8443
+  proxy-launch gemini                       # 启动 Gemini（自动开系统代理）
+  proxy-launch chrome                       # 启动走代理的 Chrome
+  proxy-launch claude-cli                   # 终端里跑 Claude Code
+  proxy-launch git clone https://github.com/x/y.git
+  proxy-launch -S zsh                       # 用 SOCKS 端口开一个 shell
+  proxy-launch -s chrome                    # 写系统代理后再开 Chrome
+  eval "\$(proxy-launch env)"                # 给当前终端设好代理变量
+  proxy-launch --off                        # 用完关闭系统代理
+
+按应用默认: chatgpt=http，claude=http，claude-cli=http（不受 --default 影响）
+其他应用默认代理: ${P}
+注意: 系统代理会影响其他遵循系统设置的应用；CLI 和 Claude 的显式代理独立设置。
+EOF
+}
+
+is_known_app() { app_names | grep -qx "$1"; }
+
+check_tunnel() {
+  local port; port="$(selected_port)"
+  if ! nc -z -w 3 "$PROXY_HOST" "$port" >/dev/null 2>&1; then
+    c_err "隧道不通：${PROXY_HOST}:${port} 无法连接。"
+    c_warn "请确认通往 ${PROXY_HOST} 的 VPN / 隧道路由正常。"
+    return 1
+  fi
+  return 0
+}
+
+exit_ip() {
+  curl -fsS --max-time 10 --noproxy '' -x "$(proxy_url)" https://api.ipify.org 2>/dev/null
+}
+
+active_service() {
+  local device
+  device="$(printf 'show State:/Network/Global/IPv4\n' | scutil | awk '/PrimaryInterface :/{print $3; exit}')"
+  [ -n "$device" ] || { c_err "无法识别活动网络，请设置 PROXY_SERVICE。"; return 1; }
+  networksetup -listnetworkserviceorder 2>/dev/null \
+    | awk -v device="$device" '/^\([0-9]+\) /{name=$0; sub(/^\([0-9]+\) /,"",name)} index($0, "Device: " device ")"){print name; exit}'
+}
+
+# 系统代理是否已经是本脚本要的那个地址（避免多余的 sudo 提示）
+system_proxy_already_on() {
+  local kind="$1"
+  [ -n "$kind" ] || kind="$SYSTEM_KIND"
+  local out; out="$(scutil --proxy 2>/dev/null)"
+  printf '%s\n' "$out" | grep -Eq 'ProxyAuto(Config|Discovery)Enable : 1' && return 1
+  if [ "$kind" = "socks" ]; then
+    printf '%s\n' "$out" | grep -Eq 'HTTPS?Enable : 1' && return 1
+    printf '%s\n' "$out" | grep -q "SOCKSEnable : 1" || return 1
+    printf '%s\n' "$out" | grep -Fqx "  SOCKSProxy : ${PROXY_HOST}" || return 1
+    printf '%s\n' "$out" | grep -Fqx "  SOCKSPort : ${SOCKS_PORT}" || return 1
+  else
+    printf '%s\n' "$out" | grep -q "SOCKSEnable : 1" && return 1
+    printf '%s\n' "$out" | grep -q "HTTPEnable : 1" || return 1
+    printf '%s\n' "$out" | grep -Fqx "  HTTPProxy : ${PROXY_HOST}" || return 1
+    printf '%s\n' "$out" | grep -Fqx "  HTTPPort : ${PROXY_PORT}" || return 1
+    printf '%s\n' "$out" | grep -q "HTTPSEnable : 1" || return 1
+    printf '%s\n' "$out" | grep -Fqx "  HTTPSProxy : ${PROXY_HOST}" || return 1
+    printf '%s\n' "$out" | grep -Fqx "  HTTPSPort : ${PROXY_PORT}" || return 1
+  fi
+  return 0
+}
+
+system_proxy_on() {
+  local svc="${PROXY_SERVICE:-$(active_service)}"
+  local kind="$1"
+  [ -n "$kind" ] || kind="$SYSTEM_KIND"
+  [ -n "$svc" ] || { c_err "未找到活动网络服务，请设置 PROXY_SERVICE。"; return 1; }
+  echo "服务: ${svc}"
+  run_cmd sudo networksetup -setautoproxystate "$svc" off || return 1
+  run_cmd sudo networksetup -setproxyautodiscovery "$svc" off || return 1
+  if [ "$kind" = "socks" ]; then
+    run_cmd sudo networksetup -setwebproxystate       "$svc" off || return 1
+    run_cmd sudo networksetup -setsecurewebproxystate "$svc" off || return 1
+    run_cmd sudo networksetup -setsocksfirewallproxy  "$svc" "$PROXY_HOST" "$SOCKS_PORT" || return 1
+    run_cmd sudo networksetup -setsocksfirewallproxystate "$svc" on || return 1
+    [ "$DRY_RUN" -eq 0 ] && c_ok "系统代理已开启（SOCKS5 -> ${PROXY_HOST}:${SOCKS_PORT}，HTTP/HTTPS 代理已关闭）"
+  else
+    run_cmd sudo networksetup -setsocksfirewallproxystate "$svc" off || return 1
+    run_cmd sudo networksetup -setwebproxy        "$svc" "$PROXY_HOST" "$PROXY_PORT" || return 1
+    run_cmd sudo networksetup -setsecurewebproxy  "$svc" "$PROXY_HOST" "$PROXY_PORT" || return 1
+    run_cmd sudo networksetup -setwebproxystate   "$svc" on || return 1
+    run_cmd sudo networksetup -setsecurewebproxystate "$svc" on || return 1
+    [ "$DRY_RUN" -eq 0 ] && c_ok "系统代理已开启（HTTP/HTTPS -> ${PROXY_HOST}:${PROXY_PORT}，SOCKS 已关闭）"
+  fi
+  return 0
+}
+
+system_proxy_off() {
+  local svc="${PROXY_SERVICE:-$(active_service)}"
+  [ -n "$svc" ] || { c_err "未找到活动网络服务，请设置 PROXY_SERVICE。"; return 1; }
+  run_cmd sudo networksetup -setwebproxystate       "$svc" off || return 1
+  run_cmd sudo networksetup -setsecurewebproxystate "$svc" off || return 1
+  run_cmd sudo networksetup -setsocksfirewallproxystate "$svc" off || return 1
+  if [ "$DRY_RUN" -eq 0 ]; then c_ok "系统代理已关闭（${svc}）"; fi
+}
+
+show_status() {
+  local svc="${PROXY_SERVICE:-$(active_service)}"
+  c_info "== 隧道 =="
+  printf '  %-24s' "${PROXY_HOST}:${PROXY_PORT}"
+  if nc -z -w 3 "$PROXY_HOST" "$PROXY_PORT" >/dev/null 2>&1; then c_ok "可达"; else c_err "不可达"; fi
+  printf '  %-24s' "${PROXY_HOST}:${SOCKS_PORT}"
+  if nc -z -w 3 "$PROXY_HOST" "$SOCKS_PORT" >/dev/null 2>&1; then c_ok "可达"; else c_err "不可达"; fi
+  c_info "== 出口 IP =="
+  local ip; ip="$(exit_ip)"
+  if [ -n "$ip" ]; then printf '  %s\n' "$ip"; else c_warn "  取不到（隧道未通或 api.ipify.org 被拦）"; fi
+  c_info "== 系统代理（${svc}）=="
+  printf '  应用默认: ChatGPT=HTTP，Claude=HTTP，Claude Code=HTTP\n'
+  printf '  其他系统代理默认类型: %s\n' "$SYSTEM_KIND"
+  scutil --proxy | grep -Ei "HTTPEnable|HTTPSEnable|SOCKSEnable|SOCKSProxy|SOCKSPort|ProxyAutoConfigEnable|HTTPPort" | sed 's/^/  /'
+  c_info "== 已运行的 GUI 应用 =="
+  for a in Claude "Google Chrome"; do
+    if pgrep -x "$a" >/dev/null 2>&1; then printf '  %s: 运行中' "$a"; else printf '  %s: 未运行' "$a"; fi
+    echo
+  done
+  [ -x /usr/sbin/lsof ] && pgrep -x Claude >/dev/null 2>&1 && {
+    c_info "== Claude 进程的代理连接 =="
+    lsof -i -nP -a -p "$(pgrep -x Claude)" 2>/dev/null | grep -E "ESTABLISHED" | head -5 | sed 's/^/  /'
+  }
+  return 0
+}
+
+run_app() {
+  local app="$1"; shift
+  # 规则网关（mihomo）在跑时优先指向它，让 CLI/环境变量也享受国内直连的分流
+  local p cp
+  if clash_gateway_active; then
+    p="http://127.0.0.1:${MIHOMO_PORT}"
+    cp="$p"
+  else
+    p="$(proxy_url)"
+    cp="$(chromium_proxy)"
+  fi
+
+  case "$app" in
+    claude)
+      local bin="/Applications/Claude.app"
+      [ -d "$bin" ] || { c_err "未找到 ${bin}"; return 1; }
+      run_cmd osascript -e 'if application "Claude" is running then tell application "Claude" to quit' || return 1
+      run_cmd open -na "$bin" --args --proxy-server="$cp" \
+        --proxy-bypass-list="<-loopback>;localhost;127.0.0.1" "$@" || return 1
+      [ "$DRY_RUN" -eq 0 ] && c_ok "已启动 Claude（代理 ${cp}）"
+      return 0
+      ;;
+    chatgpt|gemini)
+      local display bin weburl
+      case "$app" in
+        chatgpt) display="ChatGPT"; bin="/Applications/ChatGPT.app"; weburl="https://chatgpt.com/" ;;
+        gemini)  display="Gemini";  bin="/Applications/Gemini.app";  weburl="https://gemini.google.com/app" ;;
+      esac
+      if [ -d "$bin" ]; then
+        run_cmd osascript -e "if application \"$display\" is running then tell application \"$display\" to quit" || return 1
+        if [ "$app" = "gemini" ]; then
+          # Gemini 的 gRPC(Antigravity) 不读系统代理、只认 https_proxy env；
+          # 且必须经 LaunchServices(open) 启动才能正常激活窗口（nohup 拉二进制会无响应）。
+          # 用 launchctl setenv 注入 env → open → 立即 unsetenv，不影响其它应用。
+          c_warn "Gemini 以代理 env + LaunchServices 启动"
+          local v
+          for v in HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy; do
+            run_cmd launchctl setenv "$v" "$p"
+          done
+          run_cmd open -a "$display" || return 1
+          for v in HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy; do
+            run_cmd launchctl unsetenv "$v"
+          done
+        else
+          run_cmd open -na "$bin" --args "$@" || return 1
+        fi
+        [ "$DRY_RUN" -eq 0 ] && c_ok "已启动 ${display}（代理 ${p}）"
+      else
+        c_warn "未找到 ${bin}，改用走代理的 Chrome 打开 ${weburl}"
+        run_cmd open -na "/Applications/Google Chrome.app" --args \
+          --proxy-server="$(chromium_proxy)" \
+          --proxy-bypass-list="<-loopback>;localhost;127.0.0.1" \
+          --user-data-dir="$CHROME_PROFILE" --app="$weburl" "$@" || return 1
+      fi
+      return 0
+      ;;
+    chrome)
+      local bin="/Applications/Google Chrome.app"
+      [ -d "$bin" ] || { c_err "未找到 ${bin}"; return 1; }
+      run_cmd open -na "$bin" --args --proxy-server="$cp" \
+        --proxy-bypass-list="<-loopback>;localhost;127.0.0.1" \
+        --user-data-dir="$CHROME_PROFILE" "$@" || return 1
+      [ "$DRY_RUN" -eq 0 ] && c_ok "已启动 Chrome（独立 profile: ${CHROME_PROFILE}）"
+      return 0
+      ;;
+    claude-cli)
+      run_cmd env HTTP_PROXY="$p" HTTPS_PROXY="$p" ALL_PROXY="$p" \
+        http_proxy="$p" https_proxy="$p" all_proxy="$p" \
+        NO_PROXY="localhost,127.0.0.1,::1" no_proxy="localhost,127.0.0.1,::1" claude "$@"
+      ;;
+    codex)
+      run_cmd env HTTP_PROXY="$p" HTTPS_PROXY="$p" ALL_PROXY="$p" \
+        NO_PROXY="localhost,127.0.0.1" codex "$@"
+      ;;
+    zsh)
+      c_info "进入已设置代理的子 shell，退出即失效。"
+      run_cmd env HTTP_PROXY="$p" HTTPS_PROXY="$p" ALL_PROXY="$p" \
+        NO_PROXY="localhost,127.0.0.1" "${SHELL:-/bin/zsh}" "$@"
+      ;;
+    git)
+      run_cmd env GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.proxy GIT_CONFIG_VALUE_0="$p" \
+        git "$@"
+      ;;
+    npm)
+      run_cmd env npm_config_proxy="$p" npm_config_https_proxy="$p" \
+        HTTP_PROXY="$p" HTTPS_PROXY="$p" npm "$@"
+      ;;
+    pip)
+      run_cmd env HTTP_PROXY="$p" HTTPS_PROXY="$p" pip "$@"
+      ;;
+    brew)
+      run_cmd env HTTP_PROXY="$p" HTTPS_PROXY="$p" ALL_PROXY="$p" \
+        NO_PROXY="localhost,127.0.0.1" brew "$@"
+      ;;
+    curl)
+      run_cmd curl --proxy "$p" "$@"
+      ;;
+    env)
+      printf 'export HTTP_PROXY="%s"\n' "$p"
+      printf 'export HTTPS_PROXY="%s"\n' "$p"
+      printf 'export ALL_PROXY="%s"\n' "$p"
+      printf 'export NO_PROXY="localhost,127.0.0.1"\n'
+      ;;
+    *)
+      c_err "未知应用: $app"
+      c_warn "可用: $(app_names | tr '\n' ' ')"
+      return 2
+      ;;
+  esac
+}
+
+run_cmd() {
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '+'
+    printf ' %q' "$@"
+    printf '\n'
+    return 0
+  fi
+  "$@"
+}
+
+set_default() {
+  local kind="$1"
+  case "$kind" in
+    http|socks) ;;
+    *) c_err "--default 只接受 http 或 socks"; exit 2 ;;
+  esac
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '+ echo SYSTEM_KIND=%s > %s\n' "$kind" "$CONFIG_FILE"
+    exit 0
+  fi
+  mkdir -p "$CONFIG_DIR" || exit 1
+  printf 'SYSTEM_KIND=%s\n' "$kind" > "$CONFIG_FILE" || exit 1
+  c_ok "已设置默认系统代理类型: ${kind}（写入 ${CONFIG_FILE}）"
+  if [ "$kind" = "socks" ]; then
+    c_warn "ChatGPT、Claude 桌面端及 CLI 默认 HTTP，不受 --default 影响。"
+  fi
+  exit 0
+}
+
+main() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -h|--help)   usage; exit 0 ;;
+      -l|--list)   LIST_ONLY=1; shift ;;
+      -d|--dry-run) DRY_RUN=1; shift ;;
+      -s|--system) MODE="system"; shift ;;
+      -S|--socks)  PROTOCOL_OVERRIDE="socks"; shift ;;
+      -H|--http)   PROTOCOL_OVERRIDE="http"; shift ;;
+      --default)   shift; set_default "${1:-}"; shift ;;
+      --off)       MODE="off"; shift ;;
+      --)          shift; break ;;
+      -*)          c_err "未知选项: $1"; usage >&2; exit 2 ;;
+      *)           break ;;
+    esac
+  done
+
+  [ "$LIST_ONLY" -eq 1 ] && { app_names; exit 0; }
+
+  if [ "$MODE" = "off" ]; then system_proxy_off; exit $?; fi
+
+  if [ $# -eq 0 ]; then
+    c_err "缺少应用名"; echo; usage >&2; exit 2
+  fi
+
+  local app="$1"; shift
+
+  if [ "$app" = "off" ]; then all_off; exit $?; fi
+  if [ "$app" = "on" ]; then all_on; exit $?; fi
+  if [ "$app" = "sj" ]; then status_json; exit $?; fi
+  if [ "$app" = "mode" ]; then set_mode "${1:-}"; exit $?; fi
+
+  if [ "$app" = "sb" ]; then
+    case "${1:-status}" in
+      on) sb_on;; off) sb_off;; build) sb_build;; status|"") sb_status;;
+      *) c_err "sb 只接受 on/off/build/status"; exit 2;;
+    esac
+    exit $?
+  fi
+
+  if [ "$app" = "clash" ]; then
+    local cact="${1:-status}"
+    case "$cact" in
+      build)  clash_build;  exit $? ;;
+      agent)  clash_agent_install; exit $? ;;
+      on)     clash_on;     exit $? ;;
+      off)    clash_off;    exit $? ;;
+      tun-on)  clash_tun_on;  exit $? ;;
+      tun-off) clash_tun_off; exit $? ;;
+      status|"") clash_status; exit $? ;;
+      *)      c_err "clash 只接受 build / on / off / status"; exit 2 ;;
+    esac
+  fi
+
+  if [ "$app" = "pac" ]; then
+    local act="${1:-status}"
+    case "$act" in
+      build)  pac_build;   exit $? ;;
+      on)     pac_on;      exit $? ;;
+      off)    pac_off;     exit $? ;;
+      status|"") pac_status; exit $? ;;
+      *)      c_err "pac 只接受 build / on / off / status"; exit 2 ;;
+    esac
+  fi
+
+  if [ "$app" = "routes" ]; then
+    case "${1:-status}" in
+      on)     google_routes_on; exit $? ;;
+      off)    google_routes_off; exit $? ;;
+      sync)   routes_sync; exit $? ;;
+      learn)  learn_new_nets; exit $? ;;
+      install)   routes_daemon_install; exit $? ;;
+      uninstall) routes_daemon_uninstall; exit $? ;;
+      daemon)    routes_daemon_status; exit $? ;;
+      status|"") google_routes_status; exit $? ;;
+      *)      c_err "routes 只接受 on / off / sync / learn / install / uninstall / daemon / status"; exit 2 ;;
+    esac
+  fi
+
+  select_protocol "$app" || exit $?
+  if [ "$app" = "status" ]; then show_status; exit 0; fi
+  if [ "$app" = "env" ] && [ "$MODE" = "app" ]; then run_app env; exit 0; fi
+  if ! is_known_app "$app"; then
+    c_err "未知应用: $app"; c_warn "可用: $(app_names | tr '\n' ' ')"; exit 2
+  fi
+
+  if [ "$DRY_RUN" -eq 0 ]; then check_tunnel || exit 1; fi
+
+  # 检查、诊断、系统设置和启动参数共用同一次协议选择。
+  local sys_kind="http"
+  [ "$USE_SOCKS" -eq 1 ] && sys_kind="socks"
+
+  # 原生 App 使用系统代理，必要时自动开启（--off 关闭）。
+  if needs_system_proxy "$app" && [ "$MODE" != "system" ]; then
+    if system_proxy_already_on "$sys_kind"; then
+      c_ok "系统代理已是 ${sys_kind} 模式（${PROXY_HOST}），无需改动"
+    else
+      c_warn "该应用将使用系统 ${sys_kind} 代理（修改设置需要 sudo 权限）…"
+      system_proxy_on "$sys_kind" || exit 1
+    fi
+  fi
+
+  if [ "$MODE" = "system" ]; then
+    system_proxy_on "$sys_kind" || exit 1
+  fi
+
+  if [ "$DRY_RUN" -eq 0 ]; then
+    local ip; ip="$(exit_ip)"
+    [ -n "$ip" ] && c_info "出口 IP: $ip"
+  fi
+
+  run_app "$app" "$@"
+  exit $?
+}
+
+main "$@"
