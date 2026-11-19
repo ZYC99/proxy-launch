@@ -1,7 +1,12 @@
-// ProxyBar —— 菜单栏代理管理小工具（配合 ~/bin/proxy-launch）
+// ProxyBar —— 菜单栏代理管理小工具（配合 proxy-launch）
 import AppKit
 
-let PL = (NSHomeDirectory() as NSString).appendingPathComponent("bin/proxy-launch")
+let PL: String = {
+    let homeBin = (NSHomeDirectory() as NSString).appendingPathComponent("bin/proxy-launch")
+    if FileManager.default.isExecutableFile(atPath: homeBin) { return homeBin }
+    if FileManager.default.isExecutableFile(atPath: "/usr/local/bin/proxy-launch") { return "/usr/local/bin/proxy-launch" }
+    return homeBin
+}()
 let WARP = "/Applications/Cloudflare WARP.app/Contents/Resources/warp-cli"
 
 struct St { var sb=0, tun=0, mihomo=0, warp=0, port=0, sysproxy=0, route=0; var mode="rule" }

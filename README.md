@@ -30,7 +30,21 @@ WARP: 提供 172.100.0.0/24 运输到 sharenet；自身出口为国内
 
 ## 安装
 
-### 方式一：下载 Release 预编译包（推荐，开箱即用）
+### 方式一：下载 `.pkg` 图形化安装包（最省事，零命令行）
+
+前往 [GitHub Releases](https://github.com/ZYC99/proxy-launch/releases) 下载 **`proxy-launch-v*-darwin-arm64.pkg`**：
+
+1. **右键点击 `.pkg` → 打开**（因未购 Apple 开发者签名，首次需右键打开绕过 Gatekeeper 提示）。
+2. 一路点击「继续 / 安装」，自动完成：
+   - 安装 CLI 到 `/usr/local/bin/proxy-launch`（以及一键卸载命令 `proxy-launch-uninstall`）
+   - 内置 `sing-box` 与 `ProxyBar` 到 `/usr/local/libexec/proxy-launch/`（无需 Homebrew / Xcode CLT）
+   - 自动注册并拉起右上角菜单栏 **ProxyBar** 图标
+   - 自动生成配置文件模板 `~/.config/proxy-launch/config`
+3. 按需修改 `~/.config/proxy-launch/config` 中的上游节点地址，点击菜单栏 **开启代理**（或终端运行 `proxy-launch on`）即可。
+
+> 如需卸载，在终端执行 `proxy-launch-uninstall` 即可一键清理。
+
+### 方式二：下载 Release `.tar.gz` 压缩包
 
 前往 [GitHub Releases](https://github.com/ZYC99/proxy-launch/releases) 下载对应包：
 
@@ -48,7 +62,7 @@ cd proxy-launch-v*-darwin-arm64-full
 > 安装脚本会自动清理 macOS 的 `com.apple.quarantine` 隔离属性，拷贝文件到 `~/bin`、注册 `ProxyBar` 登录项并生成默认配置文件 `~/.config/proxy-launch/config`。
 > 如果系统已通过 Homebrew 安装 `sing-box`，脚本会自动优先复用系统版本。
 
-### 方式二：源码安装
+### 方式三：源码安装
 
 需要预先安装 `Xcode Command Line Tools`（提供 `swiftc`）与 `sing-box`（`brew install sing-box`）：
 

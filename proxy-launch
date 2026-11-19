@@ -371,7 +371,7 @@ clash_tun_off() {
 find_singbox() {
   if [ -n "${SB_BIN:-}" ] && [ -x "$SB_BIN" ]; then printf '%s' "$SB_BIN"; return 0; fi
   local p
-  for p in /opt/homebrew/bin/sing-box /usr/local/bin/sing-box "$HOME/bin/sing-box" "$(dirname "$SELF")/sing-box"; do
+  for p in /opt/homebrew/bin/sing-box /usr/local/bin/sing-box /usr/local/libexec/proxy-launch/sing-box "$HOME/bin/sing-box" "$(dirname "$SELF")/sing-box"; do
     if [ -x "$p" ]; then printf '%s' "$p"; return 0; fi
   done
   command -v sing-box 2>/dev/null || printf '%s' "/opt/homebrew/bin/sing-box"
