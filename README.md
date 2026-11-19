@@ -12,9 +12,8 @@ macOS 命令行 + 菜单栏的代理管理工具。用 **sing-box TUN** 做统�
 应用 / CLI / 裸socket
    ├─ 认系统代理 → 127.0.0.1:7890 (sing-box mixed)
    └─ 其余全部   → sing-box TUN (默认路由)
-                     ├─ 国内/内网/直连清单 → direct (en0, 真实国内IP)
-                     └─ 境外/代理清单/兜底 → PROXY → sharenet节点(境外出口)
-ToDesk 等特例网段 ─ 内核/16路由(优先于TUN) → WARP(国内出口)
+                     ├─ 国内/内网/直连清单/ToDesk进程 → direct (en0, 真实国内IP)
+                     └─ 境外/代理清单/兜底          → PROXY → sharenet节点(境外出口)
 WARP: 提供 172.100.0.0/24 运输到 sharenet；自身出口为国内
 ```
 
