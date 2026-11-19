@@ -250,24 +250,6 @@ learn_new_nets() {
   return 0
 }
 
-# ToDesk：走物理网卡(en0)真国内直连（配合 direct-extra.yaml 的 todesk.com 国内 DNS 解析 + sing-box 进程直连）。
-# 清理旧版本遗留的指向 WARP(utun) 的 /16 内核路由，避免与 sing-box TUN(bind_interface=en0) 产生非对称路由死锁。
-TODESK_NETS="155.102.0.0/16 43.135.0.0/16 43.132.0.0/16 43.175.0.0/16 43.162.0.0/16 43.174.0.0/16"
-todesk_routes_off() {
-  local n cur ifc removed=0
-  ifc="$(warp_interface)"
-  for n in $TODESK_NETS; do
-    cur="$(route_ifc_for "$n")"
-    if [ -n "$ifc" ] && [ "$cur" = "$ifc" ]; then
-      run_root /sbin/route delete -net "$n" >/dev/null 2>&1 && removed=$((removed+1)) || true
-    fi
-  done
-  if [ "$removed" -gt 0 ] && [ "$(id -u)" -eq 0 ] && launchctl print "system/${SB_LABEL}" >/dev/null 2>&1; then
-    /bin/launchctl kickstart -k "system/${SB_LABEL}" >/dev/null 2>&1 || true
-  fi
-  return 0
-}
-
 # 幂等同步：补齐 IP 规则 + 清理旧特例路由 + 学习 + 日志裁剪 + 系统代理守护（常驻服务周期性调用）
 routes_sync() {
   google_routes_on || return 1
@@ -413,22 +395,18 @@ def load(f):
         if m: out.append(m.group(1).lstrip('+.'))
     return out
 direct=load("direct-extra.yaml"); proxy=load("proxy-extra.yaml")
-# 基础规则：sniff + DNS劫持 + 运输层/内网直连 + ToDesk直连（两种模式都必须保留，防环路/远程断连）
+# 基础规则：sniff + DNS劫持 + 运输层/内网直连（两种模式都必须保留，防环路/远程断连）
 # 禁 IPv6 + 拒 QUIC(UDP443)：sharenet 代理不支持 IPv6/UDP，Gemini 等优先 IPv6/QUIC 会卡死，强制 IPv4+TCP
-todesk_domains=["todesk.com","youqu.com"]
-todesk_procs=["ToDesk","ToDesk_Service","ToDesk_Session_Proxy","ToDesk_XPCHelper"]
 base=[{"action":"sniff"},{"protocol":"dns","action":"hijack-dns"},
  {"ip_cidr":["172.100.0.0/24","162.159.192.0/21","162.159.137.0/24","162.159.36.0/24","162.159.200.0/24","100.64.0.0/10"],"outbound":"direct"},
  {"ip_is_private":True,"outbound":"direct"},
  {"process_name":["CloudflareWARP"],"outbound":"direct"},
- {"process_name":todesk_procs,"outbound":"direct"},
- {"domain_suffix":todesk_domains,"outbound":"direct"},
  {"ip_cidr":["::/0"],"outbound":"block"},
  {"protocol":"udp","port":[443],"action":"reject"}]
 if mode=="global":
-    # 全局：除内网/运输层/ToDesk外全部走代理
+    # 全局：除内网/运输层外全部走代理
     rules=base
-    dns_rules=[{"domain_suffix":todesk_domains,"server":"cn"}]
+    dns_rules=[]
 else:
     # 规则：国内直连 + 显式代理 + geo 兜底
     rules=base+[{"domain_suffix":direct+["cn"],"outbound":"direct"},
@@ -471,7 +449,6 @@ set_mode() {
   case "$m" in global|rule) ;; *) c_err "mode 只接受 global / rule"; return 2;; esac
   printf '%s\n' "$m" > "$CONFIG_DIR/mode"
   sb_build || return 1
-  todesk_routes_off
   if launchctl print "system/${SB_LABEL}" >/dev/null 2>&1; then
     run_root /bin/launchctl kickstart -k "system/${SB_LABEL}"
     c_ok "已切换为 ${m} 模式并重载 sing-box"
@@ -483,7 +460,6 @@ set_mode() {
 sb_on() {
   sb_build || return 1
   if [ "$DRY_RUN" -eq 1 ]; then printf '+ install root sing-box TUN %s\n' "$SB_PLIST"; return 0; fi
-  todesk_routes_off
   local owner_uid; owner_uid="$(stat -f %u "$CONFIG_DIR" 2>/dev/null || id -u)"
   launchctl bootout "gui/${owner_uid}/${AGENT_LABEL}" 2>/dev/null || true   # 停 mihomo 释放7890
   launchctl bootout system "$TUN_PLIST" 2>/dev/null || true               # 停 mihomo TUN(若存在)

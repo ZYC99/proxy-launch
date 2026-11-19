@@ -12,7 +12,7 @@ macOS 命令行 + 菜单栏的代理管理工具。用 **sing-box TUN** 做统�
 应用 / CLI / 裸socket
    ├─ 认系统代理 → 127.0.0.1:7890 (sing-box mixed)
    └─ 其余全部   → sing-box TUN (默认路由)
-                     ├─ 国内/内网/直连清单/ToDesk进程 → direct (en0, 真实国内IP)
+                     ├─ 国内/内网/直连清单 → direct (en0, 真实国内IP)
                      └─ 境外/代理清单/兜底          → PROXY → sharenet节点(境外出口)
 WARP: 提供 172.100.0.0/24 运输到 sharenet；自身出口为国内
 ```
@@ -69,14 +69,12 @@ eval "$(proxy-launch env)"   # HTTP(S)_PROXY/ALL_PROXY=http://127.0.0.1:7890
 
 ## 常驻守护
 
-`com.zyc.proxy-routes`（root，每15分钟）：补 ToDesk/特例路由、学习新网段、裁剪日志、
+`com.zyc.proxy-routes`（root，每15分钟）：补特例路由、学习新网段、裁剪日志、
 **系统代理守护**（WARP 重连会重置系统代理，自动改回 7890）。
 
 ## 常见问题
 
 - **Gemini 一直加载模型**：sharenet 不支持 IPv6/QUIC，已默认禁 IPv6+拒 UDP443 强制 IPv4/TCP。
-- **ToDesk 无连接**：先确认 root 服务 `ToDesk_Service` 在跑
-  （`launchctl bootstrap system /Library/LaunchDaemons/com.youqu.todesk.service.plist`），再谈分流。
 - **国内站绕道/变慢**：检查国内 DNS（默认 114）与直连清单；个别域名解析到境外 EdgeOne 需显式处理。
 - **WARP 断开**：境外上游失效（半断），点菜单栏 WARP 重连或 `proxy-launch off` 切纯直连。
 
