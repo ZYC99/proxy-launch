@@ -119,6 +119,10 @@ eval "$(proxy-launch env)"   # HTTP(S)_PROXY/ALL_PROXY=http://127.0.0.1:7890
 `com.zyc.proxy-routes`（root，每15分钟）：补特例路由、学习新网段、裁剪日志、
 **系统代理守护**（WARP 重连会重置系统代理，自动改回 7890）。
 
+`com.zyc.warp-heal`（root，每60秒）：**WARP 假连接自愈**——状态 Connected 但
+`172.100.0.2:1080` 不可达时（连续2次失败、5分钟冷静期）自动 disconnect/connect。
+健康时完全静默，日志 `/var/log/warp-heal.log`。
+
 ## 常见问题
 
 - **Gemini 一直加载模型**：sharenet 不支持 IPv6/QUIC，已默认禁 IPv6+拒 UDP443 强制 IPv4/TCP。
@@ -139,6 +143,8 @@ eval "$(proxy-launch env)"   # HTTP(S)_PROXY/ALL_PROXY=http://127.0.0.1:7890
 
 ## 版本说明
 
+- v1.1.0（2026-11-21）：新增 `warp-heal` WARP 假连接自愈守护（`proxy-launch warp-heal`，
+  60s 探测 + 连续2次失败 + 5分钟冷静期）；系统代理守护改为 TUN 模式保持关闭。
 - v1.0.0（2026-11-20）：首次发布。sing-box TUN 规则分流 + 菜单栏 GUI；
   隧道接口/二进制/WARP 端点全部运行时动态探测（换网、改交换机名无需改脚本）；
   TUN 模式下系统代理保持关闭（全流量走 TUN，避免 mixed 路径域名被上游拒绝）；
