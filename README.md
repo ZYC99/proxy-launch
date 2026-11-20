@@ -125,6 +125,25 @@ eval "$(proxy-launch env)"   # HTTP(S)_PROXY/ALL_PROXY=http://127.0.0.1:7890
 - **国内站绕道/变慢**：检查国内 DNS（默认 114）与直连清单；个别域名解析到境外 EdgeOne 需显式处理。
 - **WARP 断开**：境外上游失效（半断），点菜单栏 WARP 重连或 `proxy-launch off` 切纯直连。
 
+
+## 环境变量
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `PROXY_HOST` / `PROXY_PORT` / `SOCKS_PORT` | `172.100.0.2` / `8443` / `1080` | 上游节点 |
+| `CN_DNS` / `FOREIGN_DNS` | `114.114.114.114` / `1.1.1.1` | 国内/境外 DNS |
+| `WARP_IF` | 自动探测 | 手动指定 WARP 隧道接口 |
+| `WARP_EXTRA_CIDRS` | — | 追加免环路网段 |
+| `DIRECT_IF` | 自动(PrimaryInterface) | 直连网卡 |
+| `MIHOMO_PORT` | `7890` | 本地代理端口 |
+
+## 版本说明
+
+- v1.0.0（2026-11-20）：首次发布。sing-box TUN 规则分流 + 菜单栏 GUI；
+  隧道接口/二进制/WARP 端点全部运行时动态探测（换网、改交换机名无需改脚本）；
+  TUN 模式下系统代理保持关闭（全流量走 TUN，避免 mixed 路径域名被上游拒绝）；
+  支持全局/规则/纯直连模式切换与系统代理守护。
+
 ## 说明
 
 - 规则清单内嵌于 `proxy-launch`（`direct-extra`/`proxy-extra`），改后 `sb build` 重载。

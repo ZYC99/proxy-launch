@@ -1,12 +1,7 @@
-// ProxyBar —— 菜单栏代理管理小工具（配合 proxy-launch）
+// ProxyBar —— 菜单栏代理管理小工具（配合 ~/bin/proxy-launch）
 import AppKit
 
-let PL: String = {
-    let homeBin = (NSHomeDirectory() as NSString).appendingPathComponent("bin/proxy-launch")
-    if FileManager.default.isExecutableFile(atPath: homeBin) { return homeBin }
-    if FileManager.default.isExecutableFile(atPath: "/usr/local/bin/proxy-launch") { return "/usr/local/bin/proxy-launch" }
-    return homeBin
-}()
+let PL = (NSHomeDirectory() as NSString).appendingPathComponent("bin/proxy-launch")
 let WARP = "/Applications/Cloudflare WARP.app/Contents/Resources/warp-cli"
 
 struct St { var sb=0, tun=0, mihomo=0, warp=0, port=0, sysproxy=0, route=0; var mode="rule" }
@@ -57,7 +52,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let engineOn = (st.sb + st.tun + st.mihomo) > 0 && st.port == 1
         let m = st.mode == "global" ? "全局" : "规则"
         if !engineOn { return "纯直连（代理已关）" }
-        if st.warp == 1 { return "分流中 · \(m)模式 · 代理在线" }
+        if st.warp == 1 { return "分流中 · \(m)模式 · 出口CA" }
         return "半断：WARP 断开 · \(m)模式"
     }
 
@@ -70,7 +65,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         m.addItem(.separator())
         let rule = act("规则分流（国内直连）", #selector(modeRule))
         rule.state = st.mode == "rule" ? .on : .off; m.addItem(rule)
-        let glob = act("全局代理（全部走代理）", #selector(modeGlobal))
+        let glob = act("全局代理（全部走CA）", #selector(modeGlobal))
         glob.state = st.mode == "global" ? .on : .off; m.addItem(glob)
         m.addItem(.separator())
         m.addItem(act("开启代理（sing-box TUN）", #selector(onProxy)))

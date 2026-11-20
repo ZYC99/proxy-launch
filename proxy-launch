@@ -23,10 +23,6 @@ if [ "$(id -u)" -eq 0 ]; then
   HOME="$(eval echo "~${_own}")"
 fi
 
-CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/proxy-launch"
-CONFIG_FILE="$CONFIG_DIR/config"
-[ -r "$CONFIG_FILE" ] && . "$CONFIG_FILE"
-
 PROXY_HOST="${PROXY_HOST:-172.100.0.2}"
 PROXY_PORT="${PROXY_PORT:-8443}"
 SOCKS_PORT="${SOCKS_PORT:-1080}"
@@ -39,12 +35,23 @@ DRY_RUN=0
 LIST_ONLY=0
 
 # 系统代理的类型：http（默认，写 HTTP/HTTPS 端口）或 socks（写 SOCKS5 端口）
-MIHOMO_BIN="${MIHOMO_BIN:-/Applications/Clash Verge.app/Contents/MacOS/verge-mihomo}"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/proxy-launch"
+
+# 二进制路径：优先环境变量，其次 PATH，最后常见安装位置
+find_bin() { local c; for c in "$@"; do [ -n "$c" ] && [ -x "$c" ] && { printf '%s' "$c"; return 0; }; done; }
+MIHOMO_BIN="${MIHOMO_BIN:-$(find_bin "$(command -v verge-mihomo 2>/dev/null)" "/Applications/Clash Verge.app/Contents/MacOS/verge-mihomo" "$(command -v mihomo 2>/dev/null)")}"
+WARP_CLI="${WARP_CLI:-$(find_bin "$(command -v warp-cli 2>/dev/null)" "/Applications/Cloudflare WARP.app/Contents/Resources/warp-cli")}"
+# DNS：允许环境变量覆盖（不同网络下某些公共DNS可能不可达）
+CN_DNS="${CN_DNS:-114.114.114.114}"
+FOREIGN_DNS="${FOREIGN_DNS:-1.1.1.1}"
 MIHOMO_GEO_SRC="${MIHOMO_GEO_SRC:-$HOME/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev}"
 MIHOMO_DIR="$CONFIG_DIR/mihomo"
 MIHOMO_CFG="$MIHOMO_DIR/config.yaml"
 MIHOMO_PORT="${MIHOMO_PORT:-7890}"
 MIHOMO_API="${MIHOMO_API:-127.0.0.1:9090}"
+CONFIG_FILE="$CONFIG_DIR/config"
+SYSTEM_KIND="${SYSTEM_KIND:-http}"
+[ -r "$CONFIG_FILE" ] && . "$CONFIG_FILE"
 SYSTEM_KIND="${SYSTEM_KIND:-http}"
 
 c_info()  { printf '\033[36m%s\033[0m\n' "$*"; }
@@ -137,9 +144,23 @@ all_nets() {
 warp_interface() {
   local i
   if [ -n "$WARP_IF" ]; then printf '%s' "$WARP_IF"; return 0; fi
-  # 跟随 172.100/24（sharenet 节点网段）所在接口，即 WARP 隧道
+  # 优先：172.100/24（sharenet 节点网段）所在接口
   i="$(netstat -rn 2>/dev/null | awk '$1=="172.100/24"{print $NF; exit}')"
-  printf '%s' "${i:-utun4}"
+  if [ -z "$i" ]; then
+    # 兜底：找带 100.96.x（WARP 地址段）的 utun
+    i="$(ifconfig 2>/dev/null | awk '/^utun[0-9]+:/{ifc=$1; sub(":","",ifc)} /inet 100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\./{print ifc; exit}')"
+  fi
+  printf '%s' "$i"
+}
+
+# WARP 端点网段（用于 route-exclude / 免环路）：默认值 + 运行时从 WARP 进程实际连接中发现
+warp_endpoint_cidrs() {
+  local base="162.159.192.0/21 162.159.137.0/24 162.159.36.0/24 162.159.200.0/24"
+  [ -n "${WARP_EXTRA_CIDRS:-}" ] && base="$base $WARP_EXTRA_CIDRS"
+  local extra
+  extra="$(lsof -i -nP 2>/dev/null | awk '/CloudflareWARP|Cloudflare WARP/ && /->/ {print $9}' \
+            | sed 's/.*->//; s/:.*//' | grep -E '^[0-9.]+$' | sort -u | sed 's|$|/32|' | tr '\n' ' ')"
+  printf '%s %s' "$base" "$extra"
 }
 
 route_ifc_for() {
@@ -262,18 +283,32 @@ routes_sync() {
 # WARP 重连会重置系统代理。若 mihomo 在跑而系统代理没指向它，自动改回，
 # 避免 GUI 应用绕过规则网关（国内绕道/裸连被墙）。mihomo 没跑时不动系统代理。
 proxy_guard() {
-  clash_gateway_active || return 0
-  local out svc
+  local out svc tun=0
+  launchctl print "system/${SB_LABEL}" >/dev/null 2>&1 && tun=1
+  launchctl print "system/${TUN_LABEL}" >/dev/null 2>&1 && tun=1
   out="$(scutil --proxy 2>/dev/null)"
-  # 已经正确指向 7890 且无 PAC/SOCKS 干扰 → 不动
+  svc="${PROXY_SERVICE:-$(active_service)}"
+  [ -n "$svc" ] || return 0
+  if [ "$tun" -eq 1 ]; then
+    # TUN 已接管全部流量：系统代理应保持关闭。
+    # （mixed/7890 路径会把域名原样传给上游，部分站点如 YouTube 被拒；TUN 路径先解析IP则正常）
+    if printf '%s\n' "$out" | grep -Eq "HTTPEnable : 1|SOCKSEnable : 1|ProxyAutoConfigEnable : 1"; then
+      run_root networksetup -setwebproxystate       "$svc" off
+      run_root networksetup -setsecurewebproxystate "$svc" off
+      run_root networksetup -setsocksfirewallproxystate "$svc" off
+      run_root networksetup -setautoproxystate      "$svc" off
+      [ "$DRY_RUN" -eq 0 ] && c_ok "TUN 模式：已关闭系统代理（全流量走 TUN）"
+    fi
+    return 0
+  fi
+  # 无 TUN、仅用户级 mihomo：需要系统代理指向 7890
+  clash_gateway_active || return 0
   if printf '%s\n' "$out" | grep -q "HTTPProxy : 127.0.0.1" \
      && printf '%s\n' "$out" | grep -q "HTTPPort : ${MIHOMO_PORT}" \
      && printf '%s\n' "$out" | grep -q "HTTPEnable : 1" \
      && ! printf '%s\n' "$out" | grep -Eq "ProxyAutoConfigEnable : 1|SOCKSEnable : 1"; then
     return 0
   fi
-  svc="${PROXY_SERVICE:-$(active_service)}"
-  [ -n "$svc" ] || return 0
   run_root networksetup -setautoproxystate "$svc" off
   run_root networksetup -setsocksfirewallproxystate "$svc" off
   run_root networksetup -setwebproxy       "$svc" 127.0.0.1 "$MIHOMO_PORT"
@@ -368,22 +403,14 @@ clash_tun_off() {
 # ---- sing-box TUN（macOS 更稳的 TUN 实现，推荐）--------------------------------
 # 评估结论(2026-11-17)：sing-box 1.14 在 WARP 嵌套下重启稳定（mihomo TUN 重启会 DNS 环路），
 # 靠 outbound bind_interface 显式绑定（sharenet→utun4、direct→en0）解决上游/环路问题。
-find_singbox() {
-  if [ -n "${SB_BIN:-}" ] && [ -x "$SB_BIN" ]; then printf '%s' "$SB_BIN"; return 0; fi
-  local p
-  for p in /opt/homebrew/bin/sing-box /usr/local/bin/sing-box /usr/local/libexec/proxy-launch/sing-box "$HOME/bin/sing-box" "$(dirname "$SELF")/sing-box"; do
-    if [ -x "$p" ]; then printf '%s' "$p"; return 0; fi
-  done
-  command -v sing-box 2>/dev/null || printf '%s' "/opt/homebrew/bin/sing-box"
-}
-SB_BIN="$(find_singbox)"
+SB_BIN="${SB_BIN:-$(find_bin "$(command -v sing-box 2>/dev/null)" /opt/homebrew/bin/sing-box /usr/local/bin/sing-box)}"
 SB_DIR="$CONFIG_DIR/singbox"
 SB_CFG="$SB_DIR/config.json"
 SB_LABEL="com.zyc.sharenet-sb"
 SB_PLIST="/Library/LaunchDaemons/${SB_LABEL}.plist"
 
 sb_build() {
-  [ -x "$SB_BIN" ] || { c_err "未找到 sing-box：请安装 Release 完整包或执行 brew install sing-box"; return 1; }
+  [ -x "$SB_BIN" ] || { c_err "未安装 sing-box：brew install sing-box"; return 1; }
   mkdir -p "$SB_DIR" || return 1
   # 确保 direct-extra.yaml / proxy-extra.yaml 已同步最新规则
   DRY_RUN=0 clash_rules_write 2>/dev/null || true
@@ -392,6 +419,7 @@ sb_build() {
   warp_ifc="$(warp_interface)"
   direct_ifc="${DIRECT_IF:-$(printf 'show State:/Network/Global/IPv4\n' | scutil 2>/dev/null | awk '/PrimaryInterface :/{print $3; exit}')}"
   case "$direct_ifc" in ""|utun*) direct_ifc="en0" ;; esac
+  WARP_CIDRS="$(warp_endpoint_cidrs)" CN_DNS="$CN_DNS" FOREIGN_DNS="$FOREIGN_DNS" \
   python3 - "$MIHOMO_DIR/rules" "$SB_CFG" "$mode" "$PROXY_HOST" "$PROXY_PORT" "$SOCKS_PORT" "$MIHOMO_PORT" "$warp_ifc" "$direct_ifc" <<'PY'
 import json,re,sys,os
 rules,cfgp,mode,phost,pport,sport,mport,warp_ifc,direct_ifc=sys.argv[1:10]
@@ -406,7 +434,7 @@ direct=load("direct-extra.yaml"); proxy=load("proxy-extra.yaml")
 # 基础规则：sniff + DNS劫持 + 运输层/内网直连（两种模式都必须保留，防环路/远程断连）
 # 禁 IPv6 + 拒 QUIC(UDP443)：sharenet 代理不支持 IPv6/UDP，Gemini 等优先 IPv6/QUIC 会卡死，强制 IPv4+TCP
 base=[{"action":"sniff"},{"protocol":"dns","action":"hijack-dns"},
- {"ip_cidr":["172.100.0.0/24","162.159.192.0/21","162.159.137.0/24","162.159.36.0/24","162.159.200.0/24","100.64.0.0/10"],"outbound":"direct"},
+ {"ip_cidr":["172.100.0.0/24","100.64.0.0/10"]+os.environ.get("WARP_CIDRS","").split(),"outbound":"direct"},
  {"ip_is_private":True,"outbound":"direct"},
  {"process_name":["CloudflareWARP"],"outbound":"direct"},
  {"ip_cidr":["::/0"],"outbound":"block"},
@@ -424,8 +452,8 @@ else:
 cfg={
  "log":{"level":"warn","timestamp":True},
  "dns":{"servers":[
-   {"tag":"cn","type":"udp","server":"114.114.114.114","detour":"direct"},
-   {"tag":"foreign","type":"https","server":"1.1.1.1","detour":"PROXY"}],
+   {"tag":"cn","type":"udp","server":os.environ.get("CN_DNS","114.114.114.114"),"detour":"direct"},
+   {"tag":"foreign","type":"https","server":os.environ.get("FOREIGN_DNS","1.1.1.1"),"detour":"PROXY"}],
   "rules":dns_rules,
   "final":"foreign","strategy":"ipv4_only"},
  "inbounds":[
@@ -435,8 +463,8 @@ cfg={
  "outbounds":[
   {"tag":"PROXY","type":"urltest","outbounds":["sharenet-socks","sharenet-http"],
    "url":"https://www.gstatic.com/generate_204","interval":"300s"},
-  {"tag":"sharenet-socks","type":"socks","server":phost,"server_port":sport,"version":"5","bind_interface":warp_ifc},
-  {"tag":"sharenet-http","type":"http","server":phost,"server_port":pport,"bind_interface":warp_ifc},
+  {"tag":"sharenet-socks","type":"socks","server":phost,"server_port":sport,"version":"5",**({"bind_interface":warp_ifc} if warp_ifc else {})},
+  {"tag":"sharenet-http","type":"http","server":phost,"server_port":pport,**({"bind_interface":warp_ifc} if warp_ifc else {})},
   {"tag":"direct","type":"direct","bind_interface":direct_ifc},
   {"tag":"block","type":"block"}],
  "route":{"rules":rules,
@@ -520,7 +548,7 @@ status_json() {
   launchctl print "system/${SB_LABEL}" >/dev/null 2>&1 && sb=1
   launchctl print "system/${TUN_LABEL}" >/dev/null 2>&1 && tun=1
   launchctl print "gui/$(id -u)/${AGENT_LABEL}" >/dev/null 2>&1 && mu=1
-  "/Applications/Cloudflare WARP.app/Contents/Resources/warp-cli" status 2>/dev/null | head -1 | grep -q Connected && warp=1
+  "$WARP_CLI" status 2>/dev/null | head -1 | grep -q Connected && warp=1
   nc -z -w 1 127.0.0.1 "$MIHOMO_PORT" >/dev/null 2>&1 && port=1
   scutil --proxy 2>/dev/null | grep -q "HTTPEnable : 1" && sys=1
   netstat -rn 2>/dev/null | grep -q "172.100/24" && route=1
@@ -550,11 +578,12 @@ all_off() {
 all_on() {
   sb_on || return 1
   local svc; svc="${PROXY_SERVICE:-$(active_service)}"
-  run_root networksetup -setwebproxy       "$svc" 127.0.0.1 "$MIHOMO_PORT"
-  run_root networksetup -setsecurewebproxy "$svc" 127.0.0.1 "$MIHOMO_PORT"
-  run_root networksetup -setwebproxystate   "$svc" on
-  run_root networksetup -setsecurewebproxystate "$svc" on
-  c_ok "已恢复 sing-box TUN 分流"
+  # TUN 全覆盖，系统代理保持关闭（mixed 路径对部分站点被上游拒绝）
+  run_root networksetup -setwebproxystate       "$svc" off
+  run_root networksetup -setsecurewebproxystate "$svc" off
+  run_root networksetup -setsocksfirewallproxystate "$svc" off
+  run_root networksetup -setautoproxystate      "$svc" off
+  c_ok "已恢复 sing-box TUN 分流（系统代理关闭，全流量走 TUN）"
   return 0
 }
 
@@ -703,25 +732,28 @@ clash_build() {
   [ -f "$IP_RULES_FILE" ] || printf 'payload: []\n' > "$IP_RULES_FILE"
   # TUN 模式（MIHOMO_TUN=1）：接管全部流量（含绕过代理的裸 socket/gRPC），
   # 排除 WARP 隧道端点与 sharenet 私网，避免环路。需 root 运行。
-  local TUN_BLOCK="" PROXY_IF=""
+  local TUN_BLOCK="" PROXY_IF="" _wi _cidr _excl
   if [ "${MIHOMO_TUN:-0}" = "1" ]; then
-    PROXY_IF="    interface-name: utun4"
-    TUN_BLOCK='tun:
-  enable: true
-  stack: system
-  auto-route: true
-  auto-detect-interface: true
-  dns-hijack: [any:53, "tcp://any:53"]
-  route-exclude-address:
-    - 172.100.0.0/24
-    - 162.159.192.0/21
-    - 162.159.137.0/24
-    - 162.159.36.0/24
+    _wi="$(warp_interface)"
+    [ -n "$_wi" ] && PROXY_IF="    interface-name: ${_wi}"
+    _excl="    - 172.100.0.0/24
     - 10.0.0.0/8
     - 172.16.0.0/12
     - 192.168.0.0/16
     - 100.64.0.0/10
-    - 2606:4700:102::/48'
+    - 2606:4700:102::/48"
+    for _cidr in $(warp_endpoint_cidrs); do
+      _excl="${_excl}
+    - ${_cidr}"
+    done
+    TUN_BLOCK="tun:
+  enable: true
+  stack: system
+  auto-route: true
+  auto-detect-interface: true
+  dns-hijack: [any:53, \"tcp://any:53\"]
+  route-exclude-address:
+${_excl}"
   fi
   for f in geoip.dat geosite.dat; do
     if [ -f "$MIHOMO_GEO_SRC/$f" ] && [ ! -f "$MIHOMO_DIR/$f" ]; then
