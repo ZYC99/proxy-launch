@@ -140,9 +140,11 @@ eval "$(proxy-launch env)"   # HTTP(S)_PROXY/ALL_PROXY=http://127.0.0.1:7890
 | `WARP_EXTRA_CIDRS` | — | 追加免环路网段 |
 | `DIRECT_IF` | 自动(PrimaryInterface) | 直连网卡 |
 | `MIHOMO_PORT` | `7890` | 本地代理端口 |
+| `TUN_MTU` | `1280` | TUN MTU（需小于隧道实际 MTU，过大易丢包） |
 
 ## 版本说明
 
+- v1.1.1（2026-11-21）：TUN MTU 默认 9000→1280，修复长连接/流式响应在 WARP 隧道下丢包（表现为能连上但反复 network issue）；新增 `TUN_MTU` 环境变量。
 - v1.1.0（2026-11-21）：新增 `warp-heal` WARP 假连接自愈守护（`proxy-launch warp-heal`，
   60s 探测 + 连续2次失败 + 5分钟冷静期）；系统代理守护改为 TUN 模式保持关闭。
 - v1.0.0（2026-11-20）：首次发布。sing-box TUN 规则分流 + 菜单栏 GUI；

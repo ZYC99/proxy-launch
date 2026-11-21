@@ -344,6 +344,11 @@ logs_trim() {
   if [ -f "$f" ] && [ "$(stat -f %z "$f" 2>/dev/null || echo 0)" -gt 1048576 ]; then
     tail -n 500 "$f" > "$f.tmp" && cp "$f.tmp" "$f" && rm -f "$f.tmp"
   fi
+  # WARP 自愈日志：超过 256 KB 只留最后 200 行（平时为 0）
+  f="/var/log/warp-heal.log"
+  if [ -f "$f" ] && [ "$(stat -f %z "$f" 2>/dev/null || echo 0)" -gt 262144 ]; then
+    tail -n 200 "$f" > "$f.tmp" && cp "$f.tmp" "$f" && rm -f "$f.tmp"
+  fi
   return 0
 }
 
@@ -458,7 +463,7 @@ cfg={
   "final":"foreign","strategy":"ipv4_only"},
  "inbounds":[
   {"type":"tun","tag":"tun-in","address":["172.19.0.1/30"],
-   "auto_route":True,"strict_route":True,"stack":"system","mtu":9000},
+   "auto_route":True,"strict_route":True,"stack":"system","mtu":int(os.environ.get("TUN_MTU","1280"))},
   {"type":"mixed","tag":"mixed-in","listen":"127.0.0.1","listen_port":mport}],
  "outbounds":[
   {"tag":"PROXY","type":"urltest","outbounds":["sharenet-socks","sharenet-http"],
