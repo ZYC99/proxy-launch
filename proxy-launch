@@ -707,7 +707,6 @@ payload:
   - '+.sharepoint.cn'
   - '+.microsoft365.cn'
   - '+.azure.cn'
-  - 'cn.bing.com'
 DIRECT
   cat > "$MIHOMO_DIR/rules/proxy-extra.yaml" <<'PROXY'
 payload:
@@ -872,7 +871,6 @@ proxy-groups:
     proxies: [sharenet-socks, sharenet-http]
 
 rules:
-  - DOMAIN,cn.bing.com,DIRECT
   - RULE-SET,proxy-extra,PROXY
   - RULE-SET,proxy-ip,PROXY
   - RULE-SET,direct-extra,DIRECT
@@ -1388,7 +1386,7 @@ run_app() {
       [ -d "$bin" ] || { c_err "未找到 ${bin}"; return 1; }
       # TUN 已接管全部流量时，不传 --proxy-server（走 7890 mixed 会把域名原样发给上游导致 YouTube 403）
       if launchctl print "system/${SB_LABEL}" >/dev/null 2>&1 || launchctl print "system/${TUN_LABEL}" >/dev/null 2>&1; then
-        run_cmd open -na "$bin" --args --user-data-dir="$CHROME_PROFILE" "$@" || return 1
+        run_cmd open -na "$bin" --args --disable-features=AsyncDns --user-data-dir="$CHROME_PROFILE" "$@" || return 1
         [ "$DRY_RUN" -eq 0 ] && c_ok "已启动 Chrome（TUN 已接管，不走 7890；独立 profile: ${CHROME_PROFILE}）"
         return 0
       fi

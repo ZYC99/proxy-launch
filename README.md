@@ -145,6 +145,7 @@ eval "$(proxy-launch env)"   # HTTP(S)_PROXY/ALL_PROXY=http://127.0.0.1:7890
 ## 版本说明
 
 - v1.1.4（2026-11-23）：**修复 Chrome 无法打开 YouTube**——移除 `tun-in` IPv6 地址避免系统写入全局 IPv6 路由后被 TUN 假握手+RST 阻断回退；修复 QUIC 拦截规则字段（`protocol: udp` → `network: udp` + `protocol: quic`）；补全 `ytimg.com`/`youtu.be` 代理规则；TUN 运行时 `proxy-launch chrome` 不再附加 `7890` 代理参数。
+- v1.1.4（2026-11-23）：移除 cn.bing.com 的直连规则，改走代理（部分网络下国内版 Bing 直连不可达）。
 - v1.1.3（2026-11-23）：**移除出站 bind_interface / 关闭 auto_detect_interface**，改由内核路由到达上游，彻底消除 WARP 重连后接口名变化导致的 `device not configured`；IPv6 改为快速 reject，浏览器不再干等。
 - v1.1.2（2026-11-22）：warp-heal 改为**双端口探测**（1080+8443，任一不通即计失败），覆盖"单端口超时"盲区；日志标注具体失败端口。
 - v1.1.1（2026-11-21）：TUN MTU 默认 9000→1280，修复长连接/流式响应在 WARP 隧道下丢包（表现为能连上但反复 network issue）；新增 `TUN_MTU` 环境变量。
