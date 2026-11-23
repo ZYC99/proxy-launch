@@ -443,7 +443,8 @@ base=[{"action":"sniff"},{"protocol":"dns","action":"hijack-dns"},
  {"ip_is_private":True,"outbound":"direct"},
  {"process_name":["CloudflareWARP"],"outbound":"direct"},
  {"ip_cidr":["::/0"],"action":"reject"},
- {"protocol":"udp","port":[443],"action":"reject"}]
+ {"network":"udp","port":[443],"action":"reject"},
+ {"protocol":"quic","action":"reject"}]
 if mode=="global":
     # 全局：除内网/运输层外全部走代理
     rules=base
@@ -462,7 +463,7 @@ cfg={
   "rules":dns_rules,
   "final":"foreign","strategy":"ipv4_only"},
  "inbounds":[
-  {"type":"tun","tag":"tun-in","address":["172.19.0.1/30","fdfe:dcba:9876::1/126"],
+  {"type":"tun","tag":"tun-in","address":["172.19.0.1/30"],
    "auto_route":True,"strict_route":True,"stack":"system","mtu":int(os.environ.get("TUN_MTU","1280"))},
   {"type":"mixed","tag":"mixed-in","listen":"127.0.0.1","listen_port":mport}],
  "outbounds":[
@@ -736,6 +737,8 @@ payload:
   - '+.googleusercontent.com'
   - '+.googlevideo.com'
   - '+.youtube.com'
+  - '+.ytimg.com'
+  - '+.youtu.be'
   - '+.ggpht.com'
   # 开发与包管理
   - '+.github.com'
@@ -1383,6 +1386,12 @@ run_app() {
     chrome)
       local bin="/Applications/Google Chrome.app"
       [ -d "$bin" ] || { c_err "未找到 ${bin}"; return 1; }
+      # TUN 已接管全部流量时，不传 --proxy-server（走 7890 mixed 会把域名原样发给上游导致 YouTube 403）
+      if launchctl print "system/${SB_LABEL}" >/dev/null 2>&1 || launchctl print "system/${TUN_LABEL}" >/dev/null 2>&1; then
+        run_cmd open -na "$bin" --args --user-data-dir="$CHROME_PROFILE" "$@" || return 1
+        [ "$DRY_RUN" -eq 0 ] && c_ok "已启动 Chrome（TUN 已接管，不走 7890；独立 profile: ${CHROME_PROFILE}）"
+        return 0
+      fi
       run_cmd open -na "$bin" --args --proxy-server="$cp" \
         --proxy-bypass-list="<-loopback>;localhost;127.0.0.1" \
         --user-data-dir="$CHROME_PROFILE" "$@" || return 1
